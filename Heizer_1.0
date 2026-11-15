@@ -1,569 +1,278 @@
 /**
- * Shelly BLU Gateway Gen3 – Wohnzimmer Heizungssteuerung
- * SPDX-License-Identifier: BSL-1.0
- * Licensed under the Boost Software License 1.0 (https://www.boost.org/LICENSE_1_0.txt).
- *
- * Funktion:
- * Steuert 3x Shelly BLU TRV lokal anhand von 2 Fenstersensoren, Hauptschalter und App-Slidern:
- * - Hauptschalter (boolean:200 / BLU-Taster): Schaltet zwischen Komfort (number:200) und Eco (number:201).
- * - Fenstersensoren (ODER-Logik): Sichert aktuelle TRV-Sollwerte aus dem lokalen Cache und setzt Lueften (number:202).
- * - Alle Fenster wieder ZU: Stellt vorherige TRV-Sollwerte wieder her (bzw. übernimmt
- *   einen während des Lüftens geänderten Komfort/Eco-Modus).
- * - Slot-Wächter & Nachfass-Logik: Verhindert "Too many calls in progress" bei hängenden BLE-Timeouts.
- *
- * Komponenten:
- * - Gateway:         Shelly BLU Gateway Gen3 (S3GW-1DBT001)
- * - Virtuell:        boolean:200 ("Wozi Heizung"), number:200 ("Komfort"),
- *                    number:201 ("Eco"), number:202 ("Lueften")
- * - Thermostate:     3x Shelly BLU TRV (bthomedevice:200, 201, 202)
- * - Taster:          Shelly BLU Button / BLU H&T (7c:c6:b6:80:05:7a)
- * - Fenstersensoren: Küche (f4:01:cc:21:d9:4f), Wozi links (f4:01:cc:21:dd:02)
+ * Shelly BLU Gateway Gen3 – Heizungssteuerung Wohnzimmer
+ * Funktion: Steuert 3 TRVs über 2 Fenstersensoren, Taster & App-Slider.
  */
 
-// === KONFIGURATION ===
-var BLU_BUTTON_MAC       = "7c:c6:b6:80:05:7a"; // Taster (BLU H&T / BLU Button)
-var WIN1_MAC             = "f4:01:cc:21:d9:4f"; // Fenster Küche
-var WIN2_MAC             = "f4:01:cc:21:dd:02"; // Wozi Fenster links
+// === 1. KONFIGURATION & ZUSTAND ===
+var CFG = {
+  MAC_BTN: "7c:c6:b6:80:05:7a",
+  MAC_W1:  "f4:01:cc:21:d9:4f",
+  MAC_W2:  "f4:01:cc:21:dd:02",
+  TRVS:    [200, 201, 202],
+  SW_ID:   200, N_KOMF: 200, N_ECO: 201, N_LUEFT: 202,
+  T_STEP:  4000, T_VERIF: 20000, MAX_CALLS: 2, MAX_RETRIES: 1
+};
 
-var SWITCH_ID            = 200;              // boolean:200 (Wozi Heizung: true = Komfort, false = Eco)
-var NUM_KOMFORT_ID       = 200;              // number:200 (Komfort)
-var NUM_ECO_ID           = 201;              // number:201 (Eco)
-var NUM_LUEFTEN_ID       = 202;              // number:202 (Lueften)
-var TRV_IDS              = [200, 201, 202];  // bthomedevice:200, 201, 202
+var TEMPS = { komf: 22, eco: 16, lueft: 5 };
 
-// Fallback-Temperaturen (falls ein Slider noch keinen Wert hat)
-var tempKomfort          = 22;
-var tempEco              = 16;
-var tempLueften          = 5;
-var LOG_INTERVAL_SEC     = 300;              // Zyklischer Log in Sekunden (300 = 5 Min., 0 = aus)
-var STEP_DELAY_MS        = 4000;             // Abstand zwischen zwei TRV-Befehlen (4s)
-var VERIFY_DELAY_MS      = 20000;            // Wartezeit nach Durchlauf bis zur Prüfung (20s)
-var MAX_VERIFY_ROUNDS    = 1;                // Max. 1 gezielte Wiederholung (schützt vor RPC-Überlauf)
-var MAX_IN_FLIGHT_CALLS  = 2;                // Max. 2 offene BLE-Calls gleichzeitig (Limit der Engine ist 5)
+var ST = {
+  komf: true, w1: false, w2: false, over: false, modePend: false,
+  targets: {}, cache: {}, acked: {}, activePkt: {}, expected: {},
+  inFlight: 0, q: [], tQ: null, tV: null, token: 0, retries: 0
+};
 
-// Zustandsspeicher
-var isKomfort            = true;
-var win1Open             = false;
-var win2Open             = false;
-var windowOverride       = false;
-var modeChangedWhileOpen = false;
-var savedTargets         = {};     // z. B. { "200": 22.0, "201": 21.5, "202": 22.0 }
-var currentTrvTargets    = {};     // Live-Cache der aktuellen Sollwerte
+// === 2. HILFSFUNKTIONEN & PERSISTENZ ===
+function callRpc(method, params, cb) {
+  ST.inFlight++;
+  Shelly.call(method, params || {}, function (res, err, msg) {
+    ST.inFlight = Math.max(0, ST.inFlight - 1);
+    if (cb) cb(res, err, msg);
+  });
+}
 
-var lastBtnPkt           = -1;
-var lastWin1Pkt          = -1;
-var lastWin2Pkt          = -1;
-var lastWin1Ms           = -1;
-var lastWin2Ms           = -1;
-var encWarned            = {};
+function getTrvTargetFromStatus(res, id) {
+  if (!res) return null;
+  var c1 = res["blutrv:" + id];
+  if (c1 && typeof c1.target_C === "number") return c1.target_C;
+  var c2 = res["bthomedevice:" + id];
+  if (c2 && typeof c2.target_C === "number") return c2.target_C;
+  return null;
+}
 
-var callQueue            = [];
-var dispatchToken        = 0;
-var dispatchTimer        = null;
-var verifyTimer          = null;
-var expectedTargets      = {};
-var ackedTrvs            = {};
-var currentActionLabel   = "";
-var verifyRound          = 0;
-var inFlightCalls        = 0;      // Zählt aktuell noch nicht beendete Shelly.call-Aufrufe
-
-// === PERSISTENZ ===
 function saveState() {
   try {
-    Script.storage.setItem("wozi_trv_preset_state", JSON.stringify({
-      windowOverride: windowOverride,
-      modeChangedWhileOpen: modeChangedWhileOpen,
-      savedTargets: savedTargets
-    }));
-  } catch (e) {}
+    Script.storage.setItem("wozi_trv_state", JSON.stringify({ t: ST.targets }));
+  } catch (e) { print("Fehler beim Speichern: " + e); }
 }
 
 function loadState() {
   try {
-    var raw = Script.storage.getItem("wozi_trv_preset_state");
-    if (raw) {
-      var data = JSON.parse(raw);
-      if (typeof data.windowOverride === "boolean") windowOverride = data.windowOverride;
-      if (typeof data.modeChangedWhileOpen === "boolean") modeChangedWhileOpen = data.modeChangedWhileOpen;
-      if (data.savedTargets) savedTargets = data.savedTargets;
-    }
-  } catch (e) {}
+    var d = JSON.parse(Script.storage.getItem("wozi_trv_state") || "{}");
+    ST.targets = d.t || {};
+  } catch (e) { ST.targets = {}; }
+  ST.over = false;
+  ST.modePend = false;
 }
 
-// === 1. DISPATCH-QUEUE MIT SLOT-WÄCHTER & GEZIELTER WIEDERHOLUNG ===
-function verifyAndRetry(myToken) {
-  if (myToken !== dispatchToken) return;
+// === 3. STEUERUNG & WARTESCHLANGE ===
+function processQ(token) {
+  if (token !== ST.token) return;
 
-  // Falls noch zu viele alte BLE-Timeouts im Hintergrund hängen, 5s warten statt RPC-Limit zu sprengen
-  if (inFlightCalls > MAX_IN_FLIGHT_CALLS) {
-    print("Prüfung wartet noch auf freie RPC-Slots (aktiv: " + inFlightCalls + ")...");
-    verifyTimer = Timer.set(5000, false, function () {
-      verifyAndRetry(myToken);
-    });
+  if (ST.q.length === 0) {
+    print("Prüfe Quittungen in " + Math.round(CFG.T_VERIF / 1000) + "s...");
+    ST.tV = Timer.set(CFG.T_VERIF, false, function () { verifyQ(token); });
     return;
   }
 
-  inFlightCalls++;
-  Shelly.call("Shelly.GetStatus", {}, function (res) {
-    inFlightCalls = Math.max(0, inFlightCalls - 1);
-    if (myToken !== dispatchToken) return;
+  if (ST.inFlight >= CFG.MAX_CALLS) {
+    ST.tQ = Timer.set(3000, false, function () { processQ(token); });
+    return;
+  }
 
-    var statusParts = [];
-    var missingTasks = [];
+  // mJS-kompatibler Shift-Ersatz
+  var task = ST.q[0];
+  var nextQ = [];
+  for (var i = 1; i < ST.q.length; i++) nextQ.push(ST.q[i]);
+  ST.q = nextQ;
 
-    for (var i = 0; i < TRV_IDS.length; i++) {
-      var id = TRV_IDS[i];
-      var key = String(id);
-      var comp = res ? res["bthomedevice:" + id] : null;
-      var cachedTemp = (comp && typeof comp.target_C === "number") ? comp.target_C : currentTrvTargets[key];
+  print("TRV " + task.id + " -> " + task.lbl + " (" + task.temp + " °C)");
 
-      if (typeof cachedTemp === "number") {
-        currentTrvTargets[key] = cachedTemp;
+  callRpc("BluTrv.Call", { id: task.id, method: "TRV.SetTarget", params: { id: 0, target_C: task.temp } }, function (r, e, m) {
+    if (e === 0) {
+      if (token === ST.token && ST.expected[task.id] === task.temp) {
+        ST.acked[task.id] = true;
+        ST.cache[task.id] = task.temp;
       }
-
-      var wantedTemp = expectedTargets[key];
-      var confirmed = (ackedTrvs[key] === true) || (typeof cachedTemp === "number" && cachedTemp === wantedTemp);
-
-      if (confirmed) {
-        ackedTrvs[key] = true;
-        statusParts.push(id + ":OK(" + wantedTemp + "°C)");
-      } else {
-        statusParts.push(id + ":OFFEN(soll " + wantedTemp + "°C, ist " + (typeof cachedTemp === "number" ? cachedTemp + "°C" : "?") + ")");
-        missingTasks.push({
-          action: "DIRECT",
-          trvId: id,
-          targetTemp: wantedTemp,
-          label: currentActionLabel + " [Retry]"
-        });
-      }
-    }
-
-    print("Prüfung (Runde " + (verifyRound + 1) + "): [" + statusParts.join(" | ") + "]");
-
-    if (missingTasks.length === 0) {
-      print("Alle 3 TRVs bestätigt.");
-      return;
-    }
-
-    if (verifyRound < MAX_VERIFY_ROUNDS) {
-      verifyRound++;
-      print("Fehlende Quittung bei " + missingTasks.length + " TRV(s) -> sende erneut...");
-      callQueue = missingTasks;
-      processQueue(myToken);
+      print("TRV " + task.id + ": Quittung OK (" + task.temp + " °C)");
     } else {
-      print("Hinweis: Nicht alle TRVs haben quittiert (BLE-Bus ausgelastet).");
+      print("TRV " + task.id + " Hinweis: " + m);
+    }
+  });
+
+  ST.tQ = Timer.set(ST.q.length > 0 ? CFG.T_STEP : 100, false, function () { processQ(token); });
+}
+
+function verifyQ(token) {
+  if (token !== ST.token) return;
+  if (ST.inFlight >= CFG.MAX_CALLS) {
+    ST.tV = Timer.set(5000, false, function () { verifyQ(token); });
+    return;
+  }
+
+  callRpc("Shelly.GetStatus", {}, function (res) {
+    if (token !== ST.token) return;
+    var missing = [], log = [];
+
+    for (var i = 0; i < CFG.TRVS.length; i++) {
+      var id = CFG.TRVS[i], exp = ST.expected[id];
+      var statusTemp = getTrvTargetFromStatus(res, id);
+      if (statusTemp !== null) ST.cache[id] = statusTemp;
+
+      var act = (statusTemp !== null) ? statusTemp : ST.cache[id];
+      var ok = (ST.acked[id] === true) || (act === exp);
+
+      if (ok) {
+        ST.acked[id] = true;
+        ST.cache[id] = exp;
+        log.push(id + ":OK(" + exp + "°C)");
+      } else {
+        log.push(id + ":OFFEN(Ist " + (act !== undefined ? act + "°C" : "?") + " / Soll " + exp + "°C)");
+        missing.push({ id: id, temp: exp, lbl: "Retry" });
+      }
+    }
+
+    print("Prüfung (Rd " + (ST.retries + 1) + "): " + log.join(" | "));
+
+    if (missing.length === 0) {
+      print("Alle TRVs erfolgreich bestätigt.");
+    } else if (ST.retries < CFG.MAX_RETRIES) {
+      ST.retries++;
+      ST.q = missing;
+      processQ(token);
+    } else {
+      print("Hinweis: Max Retries erreicht.");
     }
   });
 }
 
-function processQueue(myToken) {
-  if (myToken !== dispatchToken) return;
+function enqueueAll(tempObj, lbl) {
+  ST.token++; ST.retries = 0; ST.expected = {}; ST.acked = {}; ST.q = [];
+  if (ST.tQ) Timer.clear(ST.tQ);
+  if (ST.tV) Timer.clear(ST.tV);
 
-  if (callQueue.length === 0) {
-    print("Befehle abgesetzt -> prüfe Quittungen in " + Math.round(VERIFY_DELAY_MS / 1000) + "s...");
-    verifyTimer = Timer.set(VERIFY_DELAY_MS, false, function () {
-      verifyAndRetry(myToken);
-    });
-    return;
+  for (var i = 0; i < CFG.TRVS.length; i++) {
+    var id = CFG.TRVS[i];
+    var t = tempObj !== null ? tempObj : (ST.targets[id] || (ST.komf ? TEMPS.komf : TEMPS.eco));
+    ST.expected[id] = t;
+    ST.q.push({ id: id, temp: t, lbl: lbl });
   }
-
-  // Slot-Schutz: Wenn bereits 2 BLE-Calls noch auf ihre Antwort warten, 3s pausieren
-  if (inFlightCalls >= MAX_IN_FLIGHT_CALLS) {
-    dispatchTimer = Timer.set(3000, false, function () {
-      processQueue(myToken);
-    });
-    return;
-  }
-
-  var task = callQueue[0];
-  var nextQueue = [];
-  for (var i = 1; i < callQueue.length; i++) {
-    nextQueue.push(callQueue[i]);
-  }
-  callQueue = nextQueue;
-
-  var key = String(task.trvId);
-  var targetTemp = task.targetTemp;
-
-  if (task.action === "RESTORE_TEMP") {
-    var fallback = isKomfort ? tempKomfort : tempEco;
-    targetTemp = (typeof savedTargets[key] === "number") ? savedTargets[key] : fallback;
-  }
-
-  expectedTargets[key] = targetTemp;
-  print("TRV " + task.trvId + " -> sende " + task.label + " (" + targetTemp + " °C)");
-
-  inFlightCalls++;
-  Shelly.call("BluTrv.Call", {
-    id: task.trvId,
-    method: "TRV.SetTarget",
-    params: { id: 0, target_C: targetTemp }
-  }, function (res, errCode, errMsg) {
-    inFlightCalls = Math.max(0, inFlightCalls - 1);
-    if (myToken === dispatchToken && errCode === 0 && expectedTargets[key] === targetTemp) {
-      ackedTrvs[key] = true;
-      currentTrvTargets[key] = targetTemp;
-      print("TRV " + task.trvId + ": Quittung OK (" + targetTemp + " °C)");
-    } else if (myToken === dispatchToken && errCode !== 0) {
-      print("TRV " + task.trvId + ": RPC-Meldung '" + errMsg + "'");
-    }
-  });
-
-  if (callQueue.length > 0) {
-    dispatchTimer = Timer.set(STEP_DELAY_MS, false, function () {
-      processQueue(myToken);
-    });
-  } else {
-    processQueue(myToken);
-  }
+  processQ(ST.token);
 }
 
-function enqueueAll(action, targetTemp, label) {
-  dispatchToken++;
-  if (dispatchTimer !== null) {
-    Timer.clear(dispatchTimer);
-    dispatchTimer = null;
-  }
-  if (verifyTimer !== null) {
-    Timer.clear(verifyTimer);
-    verifyTimer = null;
-  }
+function updateLogic() {
+  var open = ST.w1 || ST.w2;
 
-  ackedTrvs = {};
-  expectedTargets = {};
-  currentActionLabel = label;
-  verifyRound = 0;
-  callQueue = [];
-
-  for (var i = 0; i < TRV_IDS.length; i++) {
-    callQueue.push({
-      action: action,
-      trvId: TRV_IDS[i],
-      targetTemp: targetTemp,
-      label: label
-    });
-  }
-  processQueue(dispatchToken);
-}
-
-// Aktuelle Solltemperaturen sofort aus dem lokalen Gateway-Cache sichern (0 ms, kein Funk)
-function snapshotCurrentTargetsFromGateway(callback) {
-  if (inFlightCalls > MAX_IN_FLIGHT_CALLS) {
-    // Fallback aus lokalem Script-Cache, falls Gateway-RPC gerade voll ist
-    for (var j = 0; j < TRV_IDS.length; j++) {
-      var k = String(TRV_IDS[j]);
-      if (typeof currentTrvTargets[k] === "number") {
-        savedTargets[k] = currentTrvTargets[k];
-      } else if (typeof savedTargets[k] !== "number") {
-        savedTargets[k] = isKomfort ? tempKomfort : tempEco;
+  if (open && !ST.over) {
+    ST.over = true; ST.modePend = false;
+    callRpc("Shelly.GetStatus", {}, function (res) {
+      for (var i = 0; i < CFG.TRVS.length; i++) {
+        var id = CFG.TRVS[i];
+        var statusTemp = getTrvTargetFromStatus(res, id);
+        ST.targets[id] = (statusTemp !== null) ? statusTemp : (ST.cache[id] || (ST.komf ? TEMPS.komf : TEMPS.eco));
+        print("TRV " + id + ": Sollwert " + ST.targets[id] + " °C gesichert");
       }
-      print("TRV " + TRV_IDS[j] + ": Sollwert " + savedTargets[k] + " °C (Cache) gesichert");
-    }
-    saveState();
-    if (callback) callback();
-    return;
-  }
-
-  inFlightCalls++;
-  Shelly.call("Shelly.GetStatus", {}, function (res) {
-    inFlightCalls = Math.max(0, inFlightCalls - 1);
-    for (var i = 0; i < TRV_IDS.length; i++) {
-      var id = TRV_IDS[i];
-      var key = String(id);
-      var compKey = "bthomedevice:" + id;
-      var foundTemp = null;
-
-      if (typeof currentTrvTargets[key] === "number") {
-        foundTemp = currentTrvTargets[key];
-      } else if (res && res[compKey] && typeof res[compKey].target_C === "number") {
-        foundTemp = res[compKey].target_C;
-      }
-
-      if (typeof foundTemp === "number") {
-        savedTargets[key] = foundTemp;
-      } else if (typeof savedTargets[key] !== "number") {
-        savedTargets[key] = isKomfort ? tempKomfort : tempEco;
-      }
-      print("TRV " + id + ": Sollwert " + savedTargets[key] + " °C gesichert");
-    }
-    saveState();
-    if (callback) callback();
-  });
-}
-
-// === 2. STEUERLOGIK FÜR FENSTER, TASTER & SLIDER ===
-function onWindowStateChanged() {
-  var anyOpen = (win1Open || win2Open);
-
-  if (anyOpen && !windowOverride) {
-    windowOverride = true;
-    modeChangedWhileOpen = false;
-    saveState();
-    print("Fenster OFFEN -> Sollwerte sichern & Lueften (" + tempLueften + " °C) setzen");
-    snapshotCurrentTargetsFromGateway(function () {
-      enqueueAll("SET_TEMP", tempLueften, "Lueften");
-    });
-
-  } else if (!anyOpen && windowOverride) {
-    windowOverride = false;
-    saveState();
-    if (modeChangedWhileOpen) {
-      modeChangedWhileOpen = false;
       saveState();
-      var targetTemp = isKomfort ? tempKomfort : tempEco;
-      var label = isKomfort ? "Komfort" : "Eco";
-      print("Alle Fenster ZU -> Geänderten Modus '" + label + "' (" + targetTemp + " °C) setzen");
-      enqueueAll("SET_TEMP", targetTemp, label);
+      enqueueAll(TEMPS.lueft, "Lueften");
+    });
+  } else if (!open && ST.over) {
+    ST.over = false;
+    if (ST.modePend) {
+      ST.modePend = false;
+      enqueueAll(ST.komf ? TEMPS.komf : TEMPS.eco, ST.komf ? "Komfort" : "Eco");
     } else {
-      print("Alle Fenster ZU -> Vorherige Solltemperaturen wiederherstellen");
-      enqueueAll("RESTORE_TEMP", null, "Restore");
+      enqueueAll(null, "Restore");
     }
   }
 }
 
-function applyModeChange(newKomfort) {
-  isKomfort = newKomfort;
-  var label = isKomfort ? "Komfort" : "Eco";
-  var targetTemp = isKomfort ? tempKomfort : tempEco;
-
-  if (windowOverride) {
-    modeChangedWhileOpen = true;
-    saveState();
-    print("Modus auf '" + label + "' geändert (wird aktiviert, sobald Fenster geschlossen sind)");
+function applyMode(isKomf) {
+  ST.komf = isKomf;
+  if (ST.over) {
+    ST.modePend = true;
+    print("Modus gemerkt, greift nach dem Schließen.");
   } else {
-    print("Modus aktiv -> '" + label + "' (" + targetTemp + " °C) setzen");
-    enqueueAll("SET_TEMP", targetTemp, label);
+    enqueueAll(ST.komf ? TEMPS.komf : TEMPS.eco, ST.komf ? "Komfort" : "Eco");
   }
 }
 
-// === 3. ZYKLISCHER STATUS-LOG ===
-function formatAge(lastMs) {
-  if (lastMs < 0) return "kein Signal";
-  var diffSec = Math.round((Shelly.getUptimeMs() - lastMs) / 1000);
-  if (diffSec < 60) return "vor " + diffSec + "s";
-  return "vor " + Math.round(diffSec / 60) + "m";
-}
+// === 4. EVENT & BLUETOOTH HANDLER ===
+Shelly.addStatusHandler(function (e) {
+  if (!e || !e.component) return;
 
-function logStatus() {
-  var aktivText = windowOverride
-    ? "LUEFTEN (" + tempLueften + " °C, Fenster offen)"
-    : (isKomfort ? "KOMFORT (" + tempKomfort + " °C)" : "ECO (" + tempEco + " °C)");
-
-  print(
-    "[STATUS] Aktiv: " + aktivText +
-    " | Slider [K:" + tempKomfort + " / E:" + tempEco + " / L:" + tempLueften + "]" +
-    " | Küche: " + (win1Open ? "OFFEN" : "ZU") + " (" + formatAge(lastWin1Ms) + ")" +
-    " | Wozi links: " + (win2Open ? "OFFEN" : "ZU") + " (" + formatAge(lastWin2Ms) + ")" +
-    " | Gesichert: " + JSON.stringify(savedTargets)
-  );
-}
-
-if (LOG_INTERVAL_SEC > 0) {
-  Timer.set(LOG_INTERVAL_SEC * 1000, true, logStatus);
-}
-
-// === 4. VIRTUELLE KOMPONENTEN & TRV-STATUS ÜBERWACHEN ===
-function handleComponentChange(comp, val) {
-  if (comp === "boolean:" + SWITCH_ID && typeof val === "boolean") {
-    if (val !== isKomfort) {
-      applyModeChange(val);
-    }
-  } else if (comp === "number:" + NUM_KOMFORT_ID && typeof val === "number" && val !== tempKomfort) {
-    tempKomfort = val;
-    print("Slider Komfort geändert auf: " + tempKomfort + " °C");
-    if (isKomfort) {
-      if (windowOverride) {
-        modeChangedWhileOpen = true;
-        saveState();
-      } else {
-        enqueueAll("SET_TEMP", tempKomfort, "Komfort");
-      }
-    }
-  } else if (comp === "number:" + NUM_ECO_ID && typeof val === "number" && val !== tempEco) {
-    tempEco = val;
-    print("Slider Eco geändert auf: " + tempEco + " °C");
-    if (!isKomfort) {
-      if (windowOverride) {
-        modeChangedWhileOpen = true;
-        saveState();
-      } else {
-        enqueueAll("SET_TEMP", tempEco, "Eco");
-      }
-    }
-  } else if (comp === "number:" + NUM_LUEFTEN_ID && typeof val === "number" && val !== tempLueften) {
-    tempLueften = val;
-    print("Slider Lueften geändert auf: " + tempLueften + " °C");
-    if (windowOverride) {
-      enqueueAll("SET_TEMP", tempLueften, "Lueften");
-    }
-  }
-}
-
-Shelly.addStatusHandler(function (event) {
-  if (!event || !event.component) return;
-
-  if (event.component.indexOf("bthomedevice:") === 0 && event.delta && typeof event.delta.target_C === "number") {
-    var trvKey = event.component.split(":")[1];
-    currentTrvTargets[trvKey] = event.delta.target_C;
-    if (expectedTargets[trvKey] === event.delta.target_C) {
-      ackedTrvs[trvKey] = true;
-    }
+  if ((e.component.indexOf("blutrv:") === 0 || e.component.indexOf("bthomedevice:") === 0) && e.delta && typeof e.delta.target_C === "number") {
+    var trvId = parseInt(e.component.split(":")[1]);
+    ST.cache[trvId] = e.delta.target_C;
+    if (ST.expected[trvId] === e.delta.target_C) ST.acked[trvId] = true;
     return;
   }
 
-  var val = undefined;
-  if (event.delta && typeof event.delta.value !== "undefined") {
-    val = event.delta.value;
-  } else if (event.info && typeof event.info.value !== "undefined") {
-    val = event.info.value;
-  }
+  var v = (e.delta && e.delta.value !== undefined) ? e.delta.value : (e.info && e.info.value !== undefined ? e.info.value : null);
+  if (v === null) return;
 
-  if (typeof val !== "undefined") {
-    handleComponentChange(event.component, val);
-  }
+  if (e.component === "boolean:" + CFG.SW_ID && ST.komf !== v) applyMode(v);
+  else if (e.component === "number:" + CFG.N_KOMF && v !== TEMPS.komf) { TEMPS.komf = v; if (ST.komf) applyMode(true); }
+  else if (e.component === "number:" + CFG.N_ECO && v !== TEMPS.eco)   { TEMPS.eco = v;  if (!ST.komf) applyMode(false); }
+  else if (e.component === "number:" + CFG.N_LUEFT && v !== TEMPS.lueft) { TEMPS.lueft = v; if (ST.over) enqueueAll(TEMPS.lueft, "Lueften"); }
 });
 
-// === 5. BTHOME-SCANNER FÜR TASTER & BLU-FENSTERSENSOREN ===
-function parseBTHome(rawHex, lastPkt, mac) {
-  var res = { valid: false, pktId: lastPkt, button: false, windowOpen: null };
-  if (!rawHex || rawHex.length < 4) return res;
+function parseBT(hex, lastPkt) {
+  var r = { pkt: lastPkt, btn: false, win: null };
+  if (!hex || (parseInt(hex.substr(0, 2), 16) & 1)) return r;
 
-  var devInfo = parseInt(rawHex.substr(0, 2), 16);
-  if ((devInfo & 0x01) !== 0) {
-    if (!encWarned[mac]) {
-      encWarned[mac] = true;
-      print("WARNUNG: Gerät " + mac + " sendet verschlüsselt! Bitte in der Shelly BLU App 'Encryption' deaktivieren.");
-    }
-    return res;
-  }
-
-  var idx = 2;
-  while (idx + 2 <= rawHex.length) {
-    var objId = parseInt(rawHex.substr(idx, 2), 16);
-    if (objId === 0x00 && idx + 4 <= rawHex.length) {
-      var pktId = parseInt(rawHex.substr(idx + 2, 2), 16);
-      if (pktId === lastPkt) return res;
-      res.pktId = pktId;
-      res.valid = true;
-      idx += 4;
-    } else if (objId === 0x3A && idx + 4 <= rawHex.length) {
-      if (parseInt(rawHex.substr(idx + 2, 2), 16) > 0) res.button = true;
-      idx += 4;
-    } else if ((objId === 0x2D || objId === 0x11 || objId === 0x1A) && idx + 4 <= rawHex.length) {
-      res.windowOpen = parseInt(rawHex.substr(idx + 2, 2), 16) > 0;
-      idx += 4;
-    } else if (objId === 0x01 || objId === 0x15 || objId === 0x20 || objId === 0x21 || objId === 0x2E || objId === 0x46) {
-      idx += 4;
-    } else if (objId === 0x02 || objId === 0x03 || objId === 0x3F || objId === 0x40 || objId === 0x41 || objId === 0x43 || objId === 0x44 || objId === 0x45 || objId === 0x51 || objId === 0x52) {
-      idx += 6;
-    } else if (objId === 0x05 || objId === 0x42) {
-      idx += 8;
-    } else {
-      break;
+  var i = 2;
+  while (i + 2 <= hex.length) {
+    var obj = parseInt(hex.substr(i, 2), 16), val = parseInt(hex.substr(i + 2, 2), 16);
+    if (obj === 0x00) { if (val === lastPkt) return r; r.pkt = val; i += 4; }
+    else if (obj === 0x3A) { r.btn = val > 0; i += 4; }
+    else if (obj === 0x2D || obj === 0x11 || obj === 0x1A) { r.win = val > 0; i += 4; }
+    else {
+      var skip = [0x01,0x15,0x20,0x21,0x2E,0x46].indexOf(obj) >= 0 ? 4 :
+                 [0x02,0x03,0x3F,0x40,0x41,0x43,0x44,0x45,0x51,0x52].indexOf(obj) >= 0 ? 6 :
+                 [0x05,0x42].indexOf(obj) >= 0 ? 8 : 99;
+      if (skip === 99) break;
+      i += skip;
     }
   }
-  return res;
+  return r;
 }
 
-function onBleScan(event, result) {
-  if (event !== BLE.Scanner.SCAN_RESULT || !result || !result.addr) return;
-  var mac = result.addr.toLowerCase();
-  if (mac !== BLU_BUTTON_MAC && mac !== WIN1_MAC && mac !== WIN2_MAC) return;
-
-  var bthomeData = result.service_data ? result.service_data["fcd2"] : null;
-  if (!bthomeData) return;
+BLE.Scanner.Subscribe(function (ev, res) {
+  if (ev !== BLE.Scanner.SCAN_RESULT || !res || !res.service_data || !res.service_data.fcd2) return;
+  var mac = res.addr.toLowerCase();
+  if (mac !== CFG.MAC_BTN && mac !== CFG.MAC_W1 && mac !== CFG.MAC_W2) return;
 
   var hex = "";
-  for (var i = 0; i < bthomeData.length; i++) {
-    var h = bthomeData.charCodeAt(i).toString(16);
+  for (var i = 0; i < res.service_data.fcd2.length; i++) {
+    var h = res.service_data.fcd2.charCodeAt(i).toString(16);
     hex += (h.length === 1 ? "0" : "") + h;
   }
 
-  if (mac === BLU_BUTTON_MAC) {
-    var btnData = parseBTHome(hex, lastBtnPkt, mac);
-    if (btnData.valid) {
-      lastBtnPkt = btnData.pktId;
-      if (btnData.button) {
-        var nextKomfort = !isKomfort;
-        print("Taster gedrückt -> Wechsle zu " + (nextKomfort ? "Komfort" : "Eco"));
-        applyModeChange(nextKomfort);
-        if (inFlightCalls <= MAX_IN_FLIGHT_CALLS) {
-          inFlightCalls++;
-          Shelly.call("Boolean.Set", { id: SWITCH_ID, value: nextKomfort }, function () {
-            inFlightCalls = Math.max(0, inFlightCalls - 1);
-          });
-        }
-      }
-    }
-  } else if (mac === WIN1_MAC) {
-    lastWin1Ms = Shelly.getUptimeMs();
-    var w1Data = parseBTHome(hex, lastWin1Pkt, mac);
-    if (w1Data.valid) {
-      lastWin1Pkt = w1Data.pktId;
-      if (w1Data.windowOpen !== null && w1Data.windowOpen !== win1Open) {
-        win1Open = w1Data.windowOpen;
-        print("Fenster Küche: " + (win1Open ? "OFFEN" : "ZU"));
-        onWindowStateChanged();
-      }
-    }
-  } else if (mac === WIN2_MAC) {
-    lastWin2Ms = Shelly.getUptimeMs();
-    var w2Data = parseBTHome(hex, lastWin2Pkt, mac);
-    if (w2Data.valid) {
-      lastWin2Pkt = w2Data.pktId;
-      if (w2Data.windowOpen !== null && w2Data.windowOpen !== win2Open) {
-        win2Open = w2Data.windowOpen;
-        print("Wozi Fenster links: " + (win2Open ? "OFFEN" : "ZU"));
-        onWindowStateChanged();
-      }
-    }
-  }
-}
+  var d = parseBT(hex, ST.activePkt[mac] || -1);
+  if (d.pkt === (ST.activePkt[mac] || -1)) return;
+  ST.activePkt[mac] = d.pkt;
 
-BLE.Scanner.Subscribe(onBleScan);
+  if (mac === CFG.MAC_BTN && d.btn) {
+    print("Taster -> Wechsle zu " + (!ST.komf ? "Komfort" : "Eco"));
+    var nK = !ST.komf; applyMode(nK);
+    callRpc("Boolean.Set", { id: CFG.SW_ID, value: nK });
+  }
+  else if (mac === CFG.MAC_W1 && d.win !== null && ST.w1 !== d.win) {
+    ST.w1 = d.win; print("Fenster Küche: " + (ST.w1 ? "AUF" : "ZU")); updateLogic();
+  }
+  else if (mac === CFG.MAC_W2 && d.win !== null && ST.w2 !== d.win) {
+    ST.w2 = d.win; print("Fenster Wozi: " + (ST.w2 ? "AUF" : "ZU")); updateLogic();
+  }
+});
+
+// === 5. INITIALISIERUNG ===
 if (BLE.Scanner.isRunning && !BLE.Scanner.isRunning()) {
   BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false });
 }
-
-// === START-INITIALISIERUNG ===
 loadState();
-inFlightCalls++;
-Shelly.call("Shelly.GetStatus", {}, function (res) {
-  inFlightCalls = Math.max(0, inFlightCalls - 1);
-  if (res) {
-    var sw = res["boolean:" + SWITCH_ID];
-    if (sw && typeof sw.value === "boolean") {
-      isKomfort = sw.value;
-    }
 
-    var nKomfort = res["number:" + NUM_KOMFORT_ID];
-    if (nKomfort && typeof nKomfort.value === "number") {
-      tempKomfort = nKomfort.value;
-    } else {
-      Shelly.call("Number.Set", { id: NUM_KOMFORT_ID, value: tempKomfort });
-    }
+callRpc("Shelly.GetStatus", {}, function (res) {
+  if (!res) return;
+  if (res["boolean:" + CFG.SW_ID]) ST.komf = res["boolean:" + CFG.SW_ID].value;
 
-    var nEco = res["number:" + NUM_ECO_ID];
-    if (nEco && typeof nEco.value === "number") {
-      tempEco = nEco.value;
-    } else {
-      Shelly.call("Number.Set", { id: NUM_ECO_ID, value: tempEco });
-    }
+  var nK = res["number:" + CFG.N_KOMF], nE = res["number:" + CFG.N_ECO], nL = res["number:" + CFG.N_LUEFT];
+  if (nK && typeof nK.value === "number") TEMPS.komf = nK.value; else callRpc("Number.Set", { id: CFG.N_KOMF, value: TEMPS.komf });
+  if (nE && typeof nE.value === "number") TEMPS.eco = nE.value; else callRpc("Number.Set", { id: CFG.N_ECO, value: TEMPS.eco });
+  if (nL && typeof nL.value === "number") TEMPS.lueft = nL.value; else callRpc("Number.Set", { id: CFG.N_LUEFT, value: TEMPS.lueft });
 
-    var nLueften = res["number:" + NUM_LUEFTEN_ID];
-    if (nLueften && typeof nLueften.value === "number") {
-      tempLueften = nLueften.value;
-    } else {
-      Shelly.call("Number.Set", { id: NUM_LUEFTEN_ID, value: tempLueften });
-    }
-
-    for (var i = 0; i < TRV_IDS.length; i++) {
-      var id = TRV_IDS[i];
-      var trv = res["bthomedevice:" + id];
-      if (trv && typeof trv.target_C === "number") {
-        currentTrvTargets[String(id)] = trv.target_C;
-      }
-    }
+  for (var i = 0; i < CFG.TRVS.length; i++) {
+    var id = CFG.TRVS[i];
+    var t = getTrvTargetFromStatus(res, id);
+    ST.cache[id] = (t !== null) ? t : (ST.komf ? TEMPS.komf : TEMPS.eco);
   }
-  Timer.set(2000, false, logStatus);
+  print("Skript gestartet. Modus: " + (ST.komf ? "Komfort" : "Eco"));
 });
