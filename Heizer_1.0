@@ -91,4 +91,326 @@ function processQueue() {
   }
   callQueue = nextQueue;
 
-  if (task.action === "SAVE
+  if (task.action === "SAVE_AND_LUEFTEN") {
+    // Schritt 1: Aktuelle Solltemperatur vor dem Öffnen auslesen
+    Shelly.call("BluTrv.Call", {
+      id: task.trvId,
+      method: "TRV.GetStatus",
+      params: { id: 0 }
+    }, function (res, errCode, errMsg) {
+      var key = String(task.trvId);
+      if (errCode === 0 && res && typeof res.target_C === "number") {
+        savedTargets[key] = res.target_C;
+        print("TRV " + task.trvId + ": aktuelle Temp " + savedTargets[key] + " °C gesichert");
+      } else {
+        if (typeof savedTargets[key] !== "number") {
+          savedTargets[key] = isKomfort ? tempKomfort : tempEco;
+        }
+        print("TRV " + task.trvId + ": Status nicht lesbar (" + errMsg + "), Fallback " + savedTargets[key] + " °C");
+      }
+
+      // Schritt 2: Auf Lueften-Temperatur absenken
+      Shelly.call("BluTrv.Call", {
+        id: task.trvId,
+        method: "TRV.SetTarget",
+        params: { id: 0, target_C: tempLueften }
+      }, function (res2, errCode2, errMsg2) {
+        if (errCode2 === 0) {
+          saveState();
+          print("TRV " + task.trvId + ": Lueften (" + tempLueften + " °C) gesetzt");
+        } else {
+          print("TRV " + task.trvId + " Fehler bei Lueften: " + errMsg2);
+        }
+        processQueue();
+      });
+    });
+
+  } else if (task.action === "RESTORE_TEMP") {
+    var key = String(task.trvId);
+    var fallback = isKomfort ? tempKomfort : tempEco;
+    var restoreTemp = (typeof savedTargets[key] === "number") ? savedTargets[key] : fallback;
+
+    Shelly.call("BluTrv.Call", {
+      id: task.trvId,
+      method: "TRV.SetTarget",
+      params: { id: 0, target_C: restoreTemp }
+    }, function (res, errCode, errMsg) {
+      if (errCode === 0) {
+        print("TRV " + task.trvId + ": auf vorherige Soll-Temp " + restoreTemp + " °C zurückgesetzt");
+      } else {
+        print("TRV " + task.trvId + " Fehler beim Wiederherstellen: " + errMsg);
+      }
+      processQueue();
+    });
+
+  } else if (task.action === "SET_TEMP") {
+    Shelly.call("BluTrv.Call", {
+      id: task.trvId,
+      method: "TRV.SetTarget",
+      params: { id: 0, target_C: task.targetTemp }
+    }, function (res, errCode, errMsg) {
+      if (errCode === 0) {
+        print("TRV " + task.trvId + ": " + task.label + " (" + task.targetTemp + " °C) gesetzt");
+      } else {
+        print("TRV " + task.trvId + " Fehler bei " + task.label + ": " + errMsg);
+      }
+      processQueue();
+    });
+  }
+}
+
+function enqueueAll(action, targetTemp, label) {
+  callQueue = []; // Noch nicht gestartete alte Befehle verwerfen
+  for (var i = 0; i < TRV_IDS.length; i++) {
+    callQueue.push({
+      action: action,
+      trvId: TRV_IDS[i],
+      targetTemp: targetTemp,
+      label: label
+    });
+  }
+  if (!isCalling) {
+    processQueue();
+  }
+}
+
+// === 2. STEUERLOGIK FÜR FENSTER, TASTER & SLIDER ===
+function onWindowStateChanged() {
+  var anyOpen = (win1Open || win2Open);
+
+  if (anyOpen && !windowOverride) {
+    windowOverride = true;
+    modeChangedWhileOpen = false;
+    saveState();
+    print("Fenster OFFEN -> Sollwerte sichern & Lueften (" + tempLueften + " °C) setzen");
+    enqueueAll("SAVE_AND_LUEFTEN", tempLueften, "Lueften");
+
+  } else if (!anyOpen && windowOverride) {
+    windowOverride = false;
+    saveState();
+    if (modeChangedWhileOpen) {
+      modeChangedWhileOpen = false;
+      saveState();
+      var targetTemp = isKomfort ? tempKomfort : tempEco;
+      var label = isKomfort ? "Komfort" : "Eco";
+      print("Alle Fenster ZU -> Geänderten Modus '" + label + "' (" + targetTemp + " °C) setzen");
+      enqueueAll("SET_TEMP", targetTemp, label);
+    } else {
+      print("Alle Fenster ZU -> Vorherige Solltemperaturen wiederherstellen");
+      enqueueAll("RESTORE_TEMP", null, "Restore");
+    }
+  }
+}
+
+function onModeSwitchChanged(newKomfort) {
+  isKomfort = newKomfort;
+  var label = isKomfort ? "Komfort" : "Eco";
+  var targetTemp = isKomfort ? tempKomfort : tempEco;
+
+  if (windowOverride) {
+    modeChangedWhileOpen = true;
+    saveState();
+    print("Modus auf '" + label + "' geändert (wird aktiviert, sobald Fenster geschlossen sind)");
+  } else {
+    print("Modus gewechselt -> '" + label + "' (" + targetTemp + " °C) setzen");
+    enqueueAll("SET_TEMP", targetTemp, label);
+  }
+}
+
+// === 3. ZYKLISCHER STATUS-LOG ===
+function formatAge(lastMs) {
+  if (lastMs < 0) return "kein Signal";
+  var diffSec = Math.round((Shelly.getUptimeMs() - lastMs) / 1000);
+  if (diffSec < 60) return "vor " + diffSec + "s";
+  return "vor " + Math.round(diffSec / 60) + "m";
+}
+
+function logStatus() {
+  var aktivText = windowOverride
+    ? "LUEFTEN (" + tempLueften + " °C, Fenster offen)"
+    : (isKomfort ? "KOMFORT (" + tempKomfort + " °C)" : "ECO (" + tempEco + " °C)");
+
+  print(
+    "[STATUS] Aktiv: " + aktivText +
+    " | Slider [K:" + tempKomfort + " / E:" + tempEco + " / L:" + tempLueften + "]" +
+    " | Küche: " + (win1Open ? "OFFEN" : "ZU") + " (" + formatAge(lastWin1Ms) + ")" +
+    " | Wozi links: " + (win2Open ? "OFFEN" : "ZU") + " (" + formatAge(lastWin2Ms) + ")" +
+    " | Gesichert: " + JSON.stringify(savedTargets)
+  );
+}
+
+if (LOG_INTERVAL_SEC > 0) {
+  Timer.set(LOG_INTERVAL_SEC * 1000, true, logStatus);
+}
+
+// === 4. VIRTUELLE KOMPONENTEN (SCHALTER & SLIDER) ÜBERWACHEN ===
+Shelly.addStatusHandler(function (event) {
+  if (!event || !event.delta) return;
+
+  // Hauptschalter (boolean:200)
+  if (event.component === "boolean:" + SWITCH_ID && typeof event.delta.value === "boolean") {
+    onModeSwitchChanged(event.delta.value);
+
+  // Slider Komfort (number:200)
+  } else if (event.component === "number:" + NUM_KOMFORT_ID && typeof event.delta.value === "number") {
+    tempKomfort = event.delta.value;
+    print("Slider Komfort geändert auf: " + tempKomfort + " °C");
+    if (isKomfort) {
+      if (windowOverride) {
+        modeChangedWhileOpen = true;
+        saveState();
+      } else {
+        enqueueAll("SET_TEMP", tempKomfort, "Komfort");
+      }
+    }
+
+  // Slider Eco (number:201)
+  } else if (event.component === "number:" + NUM_ECO_ID && typeof event.delta.value === "number") {
+    tempEco = event.delta.value;
+    print("Slider Eco geändert auf: " + tempEco + " °C");
+    if (!isKomfort) {
+      if (windowOverride) {
+        modeChangedWhileOpen = true;
+        saveState();
+      } else {
+        enqueueAll("SET_TEMP", tempEco, "Eco");
+      }
+    }
+
+  // Slider Lueften (number:202)
+  } else if (event.component === "number:" + NUM_LUEFTEN_ID && typeof event.delta.value === "number") {
+    tempLueften = event.delta.value;
+    print("Slider Lueften geändert auf: " + tempLueften + " °C");
+    if (windowOverride) {
+      enqueueAll("SET_TEMP", tempLueften, "Lueften");
+    }
+  }
+});
+
+// === 5. BTHOME-SCANNER FÜR TASTER & BLU-FENSTERSENSOREN ===
+function parseBTHome(rawHex, lastPkt, mac) {
+  var res = { valid: false, pktId: lastPkt, button: false, windowOpen: null };
+  if (!rawHex || rawHex.length < 4) return res;
+
+  var devInfo = parseInt(rawHex.substr(0, 2), 16);
+  if ((devInfo & 0x01) !== 0) {
+    if (!encWarned[mac]) {
+      encWarned[mac] = true;
+      print("WARNUNG: Gerät " + mac + " sendet verschlüsselt! Bitte in der Shelly BLU App 'Encryption' deaktivieren.");
+    }
+    return res;
+  }
+
+  var idx = 2;
+  while (idx + 2 <= rawHex.length) {
+    var objId = parseInt(rawHex.substr(idx, 2), 16);
+    if (objId === 0x00 && idx + 4 <= rawHex.length) {
+      var pktId = parseInt(rawHex.substr(idx + 2, 2), 16);
+      if (pktId === lastPkt) return res;
+      res.pktId = pktId;
+      res.valid = true;
+      idx += 4;
+    } else if (objId === 0x3A && idx + 4 <= rawHex.length) {
+      if (parseInt(rawHex.substr(idx + 2, 2), 16) > 0) res.button = true;
+      idx += 4;
+    } else if ((objId === 0x2D || objId === 0x11 || objId === 0x1A) && idx + 4 <= rawHex.length) {
+      res.windowOpen = parseInt(rawHex.substr(idx + 2, 2), 16) > 0;
+      idx += 4;
+    } else if (objId === 0x01 || objId === 0x15 || objId === 0x20 || objId === 0x21 || objId === 0x2E || objId === 0x46) {
+      idx += 4;
+    } else if (objId === 0x02 || objId === 0x03 || objId === 0x3F || objId === 0x40 || objId === 0x41 || objId === 0x43 || objId === 0x44 || objId === 0x45 || objId === 0x51 || objId === 0x52) {
+      idx += 6;
+    } else if (objId === 0x05 || objId === 0x42) {
+      idx += 8;
+    } else {
+      break;
+    }
+  }
+  return res;
+}
+
+function onBleScan(event, result) {
+  if (event !== BLE.Scanner.SCAN_RESULT || !result || !result.addr) return;
+  var mac = result.addr.toLowerCase();
+  if (mac !== BLU_BUTTON_MAC && mac !== WIN1_MAC && mac !== WIN2_MAC) return;
+
+  var bthomeData = result.service_data ? result.service_data["fcd2"] : null;
+  if (!bthomeData) return;
+
+  var hex = "";
+  for (var i = 0; i < bthomeData.length; i++) {
+    var h = bthomeData.charCodeAt(i).toString(16);
+    hex += (h.length === 1 ? "0" : "") + h;
+  }
+
+  if (mac === BLU_BUTTON_MAC) {
+    var btnData = parseBTHome(hex, lastBtnPkt, mac);
+    if (btnData.valid) {
+      lastBtnPkt = btnData.pktId;
+      if (btnData.button) {
+        print("Taster gedrückt -> Wechsle zwischen Komfort und Eco");
+        Shelly.call("Boolean.Set", { id: SWITCH_ID, value: !isKomfort });
+      }
+    }
+  } else if (mac === WIN1_MAC) {
+    lastWin1Ms = Shelly.getUptimeMs();
+    var w1Data = parseBTHome(hex, lastWin1Pkt, mac);
+    if (w1Data.valid) {
+      lastWin1Pkt = w1Data.pktId;
+      if (w1Data.windowOpen !== null && w1Data.windowOpen !== win1Open) {
+        win1Open = w1Data.windowOpen;
+        print("Fenster Küche: " + (win1Open ? "OFFEN" : "ZU"));
+        onWindowStateChanged();
+      }
+    }
+  } else if (mac === WIN2_MAC) {
+    lastWin2Ms = Shelly.getUptimeMs();
+    var w2Data = parseBTHome(hex, lastWin2Pkt, mac);
+    if (w2Data.valid) {
+      lastWin2Pkt = w2Data.pktId;
+      if (w2Data.windowOpen !== null && w2Data.windowOpen !== win2Open) {
+        win2Open = w2Data.windowOpen;
+        print("Wozi Fenster links: " + (win2Open ? "OFFEN" : "ZU"));
+        onWindowStateChanged();
+      }
+    }
+  }
+}
+
+BLE.Scanner.Subscribe(onBleScan);
+if (BLE.Scanner.isRunning && !BLE.Scanner.isRunning()) {
+  BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false });
+}
+
+// === START-INITIALISIERUNG ===
+loadState();
+Shelly.call("Shelly.GetStatus", {}, function (res) {
+  if (res) {
+    var sw = res["boolean:" + SWITCH_ID];
+    if (sw && typeof sw.value === "boolean") {
+      isKomfort = sw.value;
+    }
+
+    var nKomfort = res["number:" + NUM_KOMFORT_ID];
+    if (nKomfort && typeof nKomfort.value === "number") {
+      tempKomfort = nKomfort.value;
+    } else {
+      Shelly.call("Number.Set", { id: NUM_KOMFORT_ID, value: tempKomfort });
+    }
+
+    var nEco = res["number:" + NUM_ECO_ID];
+    if (nEco && typeof nEco.value === "number") {
+      tempEco = nEco.value;
+    } else {
+      Shelly.call("Number.Set", { id: NUM_ECO_ID, value: tempEco });
+    }
+
+    var nLueften = res["number:" + NUM_LUEFTEN_ID];
+    if (nLueften && typeof nLueften.value === "number") {
+      tempLueften = nLueften.value;
+    } else {
+      Shelly.call("Number.Set", { id: NUM_LUEFTEN_ID, value: tempLueften });
+    }
+  }
+  Timer.set(2000, false, logStatus);
+});
