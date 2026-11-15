@@ -1,3 +1,22 @@
+/**
+ * Shelly BLU Gateway Gen3 – Wohnzimmer Heizungssteuerung
+ * SPDX-License-Identifier: BSL-1.0
+ * Licensed under the Boost Software License 1.0 (https://www.boost.org/LICENSE_1_0.txt).
+ *
+ * Funktion:
+ * Steuert 3x Shelly BLU TRV lokal anhand von Zeitplänen, 2 Fenstersensoren
+ * und einem Hauptschalter (synchronisiert über BLU-Taster & App-Widget).
+ * - Hauptschalter AUS oder min. 1 Fenster OFFEN -> Zeitpläne aus, TRVs auf 5 °C.
+ * - Hauptschalter AN und alle Fenster ZU -> Lokale TRV-Zeitpläne wieder aktiv.
+ *
+ * Komponenten:
+ * - Gateway:         Shelly BLU Gateway Gen3 (S3GW-1DBT001)
+ * - Hauptschalter:   boolean:200 ("Wozi Heizung")
+ * - Thermostate:     3x Shelly BLU TRV (bthomedevice:200, 201, 202)
+ * - Taster:          Shelly BLU Button / BLU H&T (7c:c6:b6:80:05:7a)
+ * - Fenstersensoren: Küche (f4:01:cc:21:d9:4f), Wozi links (f4:01:cc:21:dd:02)
+ */
+
 // === KONFIGURATION (komplett eingetragen) ===
 var BLU_BUTTON_MAC = "7c:c6:b6:80:05:7a"; // Taster (BLU H&T / BLU Button)
 var WIN1_MAC       = "f4:01:cc:21:d9:4f"; // Fenster Küche
