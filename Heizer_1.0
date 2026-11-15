@@ -6,7 +6,7 @@
  * Funktion:
  * Steuert 3x Shelly BLU TRV lokal anhand von 2 Fenstersensoren, Hauptschalter und App-Slidern:
  * - Hauptschalter (boolean:200 / BLU-Taster): Schaltet zwischen Komfort (number:200) und Eco (number:201).
- * - Fenstersensoren (ODER-Logik): Sichert aktuelle TRV-Sollwerte aus dem lokalen Cache und setzt Lueften (number:202).
+ * - Fenstersensoren (ODER-Logik): Sichert aktuelle TRV-Sollwerte und setzt Lueften (number:202).
  * - Alle Fenster wieder ZU: Stellt vorherige TRV-Sollwerte wieder her (bzw. übernimmt
  *   einen während des Lüftens geänderten Komfort/Eco-Modus).
  *
@@ -35,7 +35,8 @@ var tempKomfort          = 22;
 var tempEco              = 16;
 var tempLueften          = 5;
 var LOG_INTERVAL_SEC     = 300;              // Zyklischer Log in Sekunden (300 = 5 Min., 0 = aus)
-var STEP_DELAY_MS        = 2500;             // Wartezeit zwischen zwei TRV-Befehlen (2,5 Sek.)
+var TRV_STEP_TIMEOUT_MS  = 12000;            // Max. Wartezeit pro Versuch (12s statt 60s Firmware-Timeout)
+var MAX_RETRIES          = 1;                // 1 automatischer Wiederholungsversuch bei Funk-Hänger
 
 // Zustandsspeicher
 var isKomfort            = true;
@@ -44,7 +45,7 @@ var win2Open             = false;
 var windowOverride       = false;
 var modeChangedWhileOpen = false;
 var savedTargets         = {};     // z. B. { "200": 22.0, "201": 21.5, "202": 22.0 }
-var currentTrvTargets    = {};     // Live-Cache der aktuellen Sollwerte aus BTHome-Events
+var currentTrvTargets    = {};     // Live-Cache der aktuellen Sollwerte
 
 var lastBtnPkt           = -1;
 var lastWin1Pkt          = -1;
@@ -55,7 +56,8 @@ var encWarned            = {};
 
 var callQueue            = [];
 var isCalling            = false;
-var activeToken          = 0;
+var stepCounter          = 0;
+var stepTimer            = null;
 
 // === PERSISTENZ ===
 function saveState() {
@@ -80,12 +82,21 @@ function loadState() {
   } catch (e) {}
 }
 
-// === 1. SCHNELLE FEUER-UND-WEITER-QUEUE (OHNE 60s-BLOCKADE) ===
-function processQueue(token) {
-  if (token !== activeToken) return;
+// === 1. SEQUENZIELLE BLUETOOTH-RPC-WARTESCHLANGE MIT 12s-WÄCHTER & RETRY ===
+function finishStep(myStep, delayMs) {
+  if (myStep !== stepCounter) return; // Bereits durch Timeout/Retry abgelöst
+  stepCounter++;
+  if (stepTimer !== null) {
+    Timer.clear(stepTimer);
+    stepTimer = null;
+  }
+  Timer.set(delayMs, false, processQueue);
+}
+
+function processQueue() {
   if (callQueue.length === 0) {
     isCalling = false;
-    print("Alle TRV-Befehle abgesetzt.");
+    print("Alle TRV-Befehle abgeschlossen.");
     return;
   }
 
@@ -105,44 +116,78 @@ function processQueue(token) {
     targetTemp = (typeof savedTargets[key] === "number") ? savedTargets[key] : fallback;
   }
 
-  print("TRV " + task.trvId + " -> sende " + task.label + " (" + targetTemp + " °C)");
+  var attempt = task.attempt || 0;
+  var retryTag = (attempt > 0) ? " (Versuch " + (attempt + 1) + ")" : "";
+  print("TRV " + task.trvId + " -> setze " + task.label + " (" + targetTemp + " °C)" + retryTag + "...");
 
-  // Befehl absetzen (Eventuelle späte Timeout-Meldung nach 60s ignorieren, wenn Wert schon sitzt)
+  stepCounter++;
+  var myStep = stepCounter;
+
+  // 12-Sekunden-Wächter (verhindert 60s-Blockaden)
+  stepTimer = Timer.set(TRV_STEP_TIMEOUT_MS, false, function () {
+    if (myStep !== stepCounter) return;
+    if (currentTrvTargets[key] === targetTemp) {
+      print("TRV " + task.trvId + ": OK via Status-Cache (" + targetTemp + " °C)");
+      finishStep(myStep, 400);
+    } else if (attempt < MAX_RETRIES) {
+      print("TRV " + task.trvId + ": Keine Quittung nach 12s -> wiederhole...");
+      // Task wieder vorne in die Queue stellen
+      var retryTask = {
+        action: task.action,
+        trvId: task.trvId,
+        targetTemp: targetTemp,
+        label: task.label,
+        attempt: attempt + 1
+      };
+      var reordered = [retryTask];
+      for (var j = 0; j < callQueue.length; j++) {
+        reordered.push(callQueue[j]);
+      }
+      callQueue = reordered;
+      finishStep(myStep, 600);
+    } else {
+      print("TRV " + task.trvId + ": Übersprungen nach Retry (nächster TRV folgt)");
+      finishStep(myStep, 400);
+    }
+  });
+
   Shelly.call("BluTrv.Call", {
     id: task.trvId,
     method: "TRV.SetTarget",
     params: { id: 0, target_C: targetTemp }
   }, function (res, errCode, errMsg) {
+    if (myStep !== stepCounter) return; // Späte Antwort nach Ablauf des 12s-Wächters ignorieren
     if (errCode === 0) {
-      print("TRV " + task.trvId + ": RPC-Quittung OK (" + targetTemp + " °C)");
-    } else if (currentTrvTargets[key] === targetTemp) {
-      print("TRV " + task.trvId + ": Zielwert " + targetTemp + " °C bereits aktiv (später RPC-Timeout ignoriert)");
+      currentTrvTargets[key] = targetTemp;
+      print("TRV " + task.trvId + ": OK (" + targetTemp + " °C)");
+      finishStep(myStep, 500);
     } else {
-      print("TRV " + task.trvId + " Warnung (" + task.label + "): " + errMsg);
+      print("TRV " + task.trvId + ": Fehler (" + errMsg + ")");
+      finishStep(myStep, 500);
     }
-  });
-
-  // Nicht 60s auf die RPC-Antwort warten, sondern nach 2,5s den nächsten TRV ansteuern
-  Timer.set(STEP_DELAY_MS, false, function () {
-    processQueue(token);
   });
 }
 
 function enqueueAll(action, targetTemp, label) {
-  activeToken++;
+  stepCounter++; // Laufenden Schritt invalidieren
+  if (stepTimer !== null) {
+    Timer.clear(stepTimer);
+    stepTimer = null;
+  }
   callQueue = [];
   for (var i = 0; i < TRV_IDS.length; i++) {
     callQueue.push({
       action: action,
       trvId: TRV_IDS[i],
       targetTemp: targetTemp,
-      label: label
+      label: label,
+      attempt: 0
     });
   }
-  processQueue(activeToken);
+  processQueue();
 }
 
-// Aktuelle Solltemperaturen blitzschnell aus dem lokalen Gateway-Status sichern (0 ms, kein Funk)
+// Aktuelle Solltemperaturen sofort aus dem lokalen Gateway-Cache sichern (0 ms, kein Funk)
 function snapshotCurrentTargetsFromGateway(callback) {
   Shelly.call("Shelly.GetStatus", {}, function (res) {
     for (var i = 0; i < TRV_IDS.length; i++) {
@@ -199,7 +244,7 @@ function onWindowStateChanged() {
   }
 }
 
-function onModeSwitchChanged(newKomfort) {
+function applyModeChange(newKomfort) {
   isKomfort = newKomfort;
   var label = isKomfort ? "Komfort" : "Eco";
   var targetTemp = isKomfort ? tempKomfort : tempEco;
@@ -209,7 +254,7 @@ function onModeSwitchChanged(newKomfort) {
     saveState();
     print("Modus auf '" + label + "' geändert (wird aktiviert, sobald Fenster geschlossen sind)");
   } else {
-    print("Modus gewechselt -> '" + label + "' (" + targetTemp + " °C) setzen");
+    print("Modus aktiv -> '" + label + "' (" + targetTemp + " °C) setzen");
     enqueueAll("SET_TEMP", targetTemp, label);
   }
 }
@@ -241,25 +286,13 @@ if (LOG_INTERVAL_SEC > 0) {
 }
 
 // === 4. VIRTUELLE KOMPONENTEN & TRV-STATUS ÜBERWACHEN ===
-Shelly.addStatusHandler(function (event) {
-  if (!event || !event.delta) return;
-
-  // Live-Sollwerte der TRVs mitschneiden (für blitzschnelles Speichern & Bestätigung)
-  if (event.component && event.component.indexOf("bthomedevice:") === 0) {
-    var trvKey = event.component.split(":")[1];
-    if (typeof event.delta.target_C === "number") {
-      currentTrvTargets[trvKey] = event.delta.target_C;
+function handleComponentChange(comp, val) {
+  if (comp === "boolean:" + SWITCH_ID && typeof val === "boolean") {
+    if (val !== isKomfort) {
+      applyModeChange(val);
     }
-    return;
-  }
-
-  // Hauptschalter (boolean:200)
-  if (event.component === "boolean:" + SWITCH_ID && typeof event.delta.value === "boolean") {
-    onModeSwitchChanged(event.delta.value);
-
-  // Slider Komfort (number:200)
-  } else if (event.component === "number:" + NUM_KOMFORT_ID && typeof event.delta.value === "number") {
-    tempKomfort = event.delta.value;
+  } else if (comp === "number:" + NUM_KOMFORT_ID && typeof val === "number" && val !== tempKomfort) {
+    tempKomfort = val;
     print("Slider Komfort geändert auf: " + tempKomfort + " °C");
     if (isKomfort) {
       if (windowOverride) {
@@ -269,10 +302,8 @@ Shelly.addStatusHandler(function (event) {
         enqueueAll("SET_TEMP", tempKomfort, "Komfort");
       }
     }
-
-  // Slider Eco (number:201)
-  } else if (event.component === "number:" + NUM_ECO_ID && typeof event.delta.value === "number") {
-    tempEco = event.delta.value;
+  } else if (comp === "number:" + NUM_ECO_ID && typeof val === "number" && val !== tempEco) {
+    tempEco = val;
     print("Slider Eco geändert auf: " + tempEco + " °C");
     if (!isKomfort) {
       if (windowOverride) {
@@ -282,14 +313,33 @@ Shelly.addStatusHandler(function (event) {
         enqueueAll("SET_TEMP", tempEco, "Eco");
       }
     }
-
-  // Slider Lueften (number:202)
-  } else if (event.component === "number:" + NUM_LUEFTEN_ID && typeof event.delta.value === "number") {
-    tempLueften = event.delta.value;
+  } else if (comp === "number:" + NUM_LUEFTEN_ID && typeof val === "number" && val !== tempLueften) {
+    tempLueften = val;
     print("Slider Lueften geändert auf: " + tempLueften + " °C");
     if (windowOverride) {
       enqueueAll("SET_TEMP", tempLueften, "Lueften");
     }
+  }
+}
+
+Shelly.addStatusHandler(function (event) {
+  if (!event || !event.component) return;
+
+  if (event.component.indexOf("bthomedevice:") === 0 && event.delta && typeof event.delta.target_C === "number") {
+    var trvKey = event.component.split(":")[1];
+    currentTrvTargets[trvKey] = event.delta.target_C;
+    return;
+  }
+
+  var val = undefined;
+  if (event.delta && typeof event.delta.value !== "undefined") {
+    val = event.delta.value;
+  } else if (event.info && typeof event.info.value !== "undefined") {
+    val = event.info.value;
+  }
+
+  if (typeof val !== "undefined") {
+    handleComponentChange(event.component, val);
   }
 });
 
@@ -354,8 +404,10 @@ function onBleScan(event, result) {
     if (btnData.valid) {
       lastBtnPkt = btnData.pktId;
       if (btnData.button) {
-        print("Taster gedrückt -> Wechsle zwischen Komfort und Eco");
-        Shelly.call("Boolean.Set", { id: SWITCH_ID, value: !isKomfort });
+        var nextKomfort = !isKomfort;
+        print("Taster gedrückt -> Wechsle zu " + (nextKomfort ? "Komfort" : "Eco"));
+        applyModeChange(nextKomfort);
+        Shelly.call("Boolean.Set", { id: SWITCH_ID, value: nextKomfort });
       }
     }
   } else if (mac === WIN1_MAC) {
