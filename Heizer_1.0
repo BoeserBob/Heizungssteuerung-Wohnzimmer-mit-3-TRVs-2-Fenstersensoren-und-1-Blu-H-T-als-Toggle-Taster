@@ -1,0 +1,145 @@
+// === KONFIGURATION (komplett eingetragen) ===
+var BLU_BUTTON_MAC = "7c:c6:b6:80:05:7a"; // Taster (BLU H&T / BLU Button)
+var WIN1_MAC       = "f4:01:cc:21:d9:4f"; // Fenster Küche
+var WIN2_MAC       = "f4:01:cc:21:dd:02"; // Wozi Fenster links
+
+var SWITCH_ID = 200;              // boolean:200 (Wozi Heizung)
+var TRV_IDS   = [200, 201, 202];  // bthomedevice:200, 201, 202
+
+// Zustandsspeicher
+var heatingEnabled = false;
+var win1Open = false;
+var win2Open = false;
+var lastBtnPkt = -1;
+var lastWin1Pkt = -1;
+var lastWin2Pkt = -1;
+
+// === 1. ZENTRALE HEIZUNGSLOGIK ===
+function updateHeating() {
+  if (!heatingEnabled) {
+    print("Heizung AUS -> Zeitplan aus, TRVs auf 5 °C");
+    setAllBluTrvs(false);
+  } else if (win1Open || win2Open) {
+    print("Fenster OFFEN -> Pause, TRVs auf 5 °C");
+    setAllBluTrvs(false);
+  } else {
+    print("Heizung AN & beide Fenster ZU -> Zeitplan aktiv");
+    setAllBluTrvs(true);
+  }
+}
+
+// Steuert alle 3 Shelly BLU TRVs direkt lokal per RPC
+function setAllBluTrvs(active) {
+  for (var i = 0; i < TRV_IDS.length; i++) {
+    var trvId = TRV_IDS[i];
+    if (active) {
+      Shelly.call("BluTrv.Call", {
+        id: trvId,
+        method: "TRV.SetConfig",
+        params: { id: 0, config: { enable: true } }
+      });
+    } else {
+      Shelly.call("BluTrv.Call", {
+        id: trvId,
+        method: "TRV.SetConfig",
+        params: { id: 0, config: { enable: false } }
+      });
+      Shelly.call("BluTrv.Call", {
+        id: trvId,
+        method: "TRV.SetTarget",
+        params: { id: 0, target_C: 5 }
+      });
+    }
+  }
+}
+
+// === 2. HAUPTSCHALTER (WIDGET & TASTER) ÜBERWACHEN ===
+Shelly.addStatusHandler(function (event) {
+  if (event.component === "boolean:" + SWITCH_ID && event.delta && typeof event.delta.value === "boolean") {
+    heatingEnabled = event.delta.value;
+    updateHeating();
+  }
+});
+
+// === 3. BTHOME-SCANNER FÜR TASTER & BLU-FENSTERSENSOREN ===
+function parseBTHome(rawHex, lastPkt) {
+  var res = { valid: false, pktId: lastPkt, button: false, windowOpen: null };
+  if (!rawHex || rawHex.length < 4) return res;
+
+  var idx = 2;
+  while (idx + 2 <= rawHex.length) {
+    var objId = parseInt(rawHex.substr(idx, 2), 16);
+    if (objId === 0x00 && idx + 4 <= rawHex.length) {
+      var pktId = parseInt(rawHex.substr(idx + 2, 2), 16);
+      if (pktId === lastPkt) return res;
+      res.pktId = pktId;
+      res.valid = true;
+      idx += 4;
+    } else if (objId === 0x3A && idx + 4 <= rawHex.length) {
+      if (parseInt(rawHex.substr(idx + 2, 2), 16) > 0) res.button = true;
+      idx += 4;
+    } else if ((objId === 0x2D || objId === 0x11) && idx + 4 <= rawHex.length) {
+      res.windowOpen = parseInt(rawHex.substr(idx + 2, 2), 16) > 0;
+      idx += 4;
+    } else if (objId === 0x01 || objId === 0x05 || objId === 0x15 || objId === 0x21) {
+      idx += 4;
+    } else if (objId === 0x02 || objId === 0x03 || objId === 0x2E || objId === 0x3F || objId === 0x45) {
+      idx += 6;
+    } else {
+      break;
+    }
+  }
+  return res;
+}
+
+BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false }, function (event, result) {
+  if (event !== BLE.Scanner.SCAN_RESULT || !result || !result.addr) return;
+  var mac = result.addr.toLowerCase();
+  var bthomeData = result.service_data ? result.service_data["fcd2"] : null;
+  if (!bthomeData) return;
+
+  var hex = "";
+  for (var i = 0; i < bthomeData.length; i++) {
+    var h = bthomeData.charCodeAt(i).toString(16);
+    hex += (h.length === 1 ? "0" : "") + h;
+  }
+
+  if (mac === BLU_BUTTON_MAC) {
+    var btnData = parseBTHome(hex, lastBtnPkt);
+    if (btnData.valid) {
+      lastBtnPkt = btnData.pktId;
+      if (btnData.button) {
+        print("Taster gedrückt!");
+        Shelly.call("Boolean.Set", { id: SWITCH_ID, value: !heatingEnabled });
+      }
+    }
+  } else if (mac === WIN1_MAC) {
+    var w1Data = parseBTHome(hex, lastWin1Pkt);
+    if (w1Data.valid) {
+      lastWin1Pkt = w1Data.pktId;
+      if (w1Data.windowOpen !== null && w1Data.windowOpen !== win1Open) {
+        win1Open = w1Data.windowOpen;
+        print("Fenster Küche: " + (win1Open ? "OFFEN" : "ZU"));
+        updateHeating();
+      }
+    }
+  } else if (mac === WIN2_MAC) {
+    var w2Data = parseBTHome(hex, lastWin2Pkt);
+    if (w2Data.valid) {
+      lastWin2Pkt = w2Data.pktId;
+      if (w2Data.windowOpen !== null && w2Data.windowOpen !== win2Open) {
+        win2Open = w2Data.windowOpen;
+        print("Wozi Fenster links: " + (win2Open ? "OFFEN" : "ZU"));
+        updateHeating();
+      }
+    }
+  }
+});
+
+// Beim Start aktuellen Zustand von boolean:200 laden
+Shelly.call("Boolean.GetStatus", { id: SWITCH_ID }, function (res) {
+  if (res && typeof res.value === "boolean") {
+    heatingEnabled = res.value;
+    updateHeating();
+  }
+});
