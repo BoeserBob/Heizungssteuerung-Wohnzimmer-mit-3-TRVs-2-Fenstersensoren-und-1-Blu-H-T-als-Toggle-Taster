@@ -6,9 +6,10 @@
  * Funktion:
  * Steuert 3x Shelly BLU TRV lokal anhand von 2 Fenstersensoren, Hauptschalter und App-Slidern:
  * - Hauptschalter (boolean:200 / BLU-Taster): Schaltet zwischen Komfort (number:200) und Eco (number:201).
- * - Fenstersensoren (ODER-Logik): Sichert aktuelle TRV-Sollwerte und setzt Lueften (number:202).
+ * - Fenstersensoren (ODER-Logik): Sichert aktuelle TRV-Sollwerte aus dem lokalen Cache und setzt Lueften (number:202).
  * - Alle Fenster wieder ZU: Stellt vorherige TRV-Sollwerte wieder her (bzw. übernimmt
  *   einen während des Lüftens geänderten Komfort/Eco-Modus).
+ * - Slot-Wächter & Nachfass-Logik: Verhindert "Too many calls in progress" bei hängenden BLE-Timeouts.
  *
  * Komponenten:
  * - Gateway:         Shelly BLU Gateway Gen3 (S3GW-1DBT001)
@@ -35,8 +36,10 @@ var tempKomfort          = 22;
 var tempEco              = 16;
 var tempLueften          = 5;
 var LOG_INTERVAL_SEC     = 300;              // Zyklischer Log in Sekunden (300 = 5 Min., 0 = aus)
-var TRV_STEP_TIMEOUT_MS  = 12000;            // Max. Wartezeit pro Versuch (12s statt 60s Firmware-Timeout)
-var MAX_RETRIES          = 1;                // 1 automatischer Wiederholungsversuch bei Funk-Hänger
+var STEP_DELAY_MS        = 4000;             // Abstand zwischen zwei TRV-Befehlen (4s)
+var VERIFY_DELAY_MS      = 20000;            // Wartezeit nach Durchlauf bis zur Prüfung (20s)
+var MAX_VERIFY_ROUNDS    = 1;                // Max. 1 gezielte Wiederholung (schützt vor RPC-Überlauf)
+var MAX_IN_FLIGHT_CALLS  = 2;                // Max. 2 offene BLE-Calls gleichzeitig (Limit der Engine ist 5)
 
 // Zustandsspeicher
 var isKomfort            = true;
@@ -55,9 +58,14 @@ var lastWin2Ms           = -1;
 var encWarned            = {};
 
 var callQueue            = [];
-var isCalling            = false;
-var stepCounter          = 0;
-var stepTimer            = null;
+var dispatchToken        = 0;
+var dispatchTimer        = null;
+var verifyTimer          = null;
+var expectedTargets      = {};
+var ackedTrvs            = {};
+var currentActionLabel   = "";
+var verifyRound          = 0;
+var inFlightCalls        = 0;      // Zählt aktuell noch nicht beendete Shelly.call-Aufrufe
 
 // === PERSISTENZ ===
 function saveState() {
@@ -82,25 +90,91 @@ function loadState() {
   } catch (e) {}
 }
 
-// === 1. SEQUENZIELLE BLUETOOTH-RPC-WARTESCHLANGE MIT 12s-WÄCHTER & RETRY ===
-function finishStep(myStep, delayMs) {
-  if (myStep !== stepCounter) return; // Bereits durch Timeout/Retry abgelöst
-  stepCounter++;
-  if (stepTimer !== null) {
-    Timer.clear(stepTimer);
-    stepTimer = null;
-  }
-  Timer.set(delayMs, false, processQueue);
-}
+// === 1. DISPATCH-QUEUE MIT SLOT-WÄCHTER & GEZIELTER WIEDERHOLUNG ===
+function verifyAndRetry(myToken) {
+  if (myToken !== dispatchToken) return;
 
-function processQueue() {
-  if (callQueue.length === 0) {
-    isCalling = false;
-    print("Alle TRV-Befehle abgeschlossen.");
+  // Falls noch zu viele alte BLE-Timeouts im Hintergrund hängen, 5s warten statt RPC-Limit zu sprengen
+  if (inFlightCalls > MAX_IN_FLIGHT_CALLS) {
+    print("Prüfung wartet noch auf freie RPC-Slots (aktiv: " + inFlightCalls + ")...");
+    verifyTimer = Timer.set(5000, false, function () {
+      verifyAndRetry(myToken);
+    });
     return;
   }
 
-  isCalling = true;
+  inFlightCalls++;
+  Shelly.call("Shelly.GetStatus", {}, function (res) {
+    inFlightCalls = Math.max(0, inFlightCalls - 1);
+    if (myToken !== dispatchToken) return;
+
+    var statusParts = [];
+    var missingTasks = [];
+
+    for (var i = 0; i < TRV_IDS.length; i++) {
+      var id = TRV_IDS[i];
+      var key = String(id);
+      var comp = res ? res["bthomedevice:" + id] : null;
+      var cachedTemp = (comp && typeof comp.target_C === "number") ? comp.target_C : currentTrvTargets[key];
+
+      if (typeof cachedTemp === "number") {
+        currentTrvTargets[key] = cachedTemp;
+      }
+
+      var wantedTemp = expectedTargets[key];
+      var confirmed = (ackedTrvs[key] === true) || (typeof cachedTemp === "number" && cachedTemp === wantedTemp);
+
+      if (confirmed) {
+        ackedTrvs[key] = true;
+        statusParts.push(id + ":OK(" + wantedTemp + "°C)");
+      } else {
+        statusParts.push(id + ":OFFEN(soll " + wantedTemp + "°C, ist " + (typeof cachedTemp === "number" ? cachedTemp + "°C" : "?") + ")");
+        missingTasks.push({
+          action: "DIRECT",
+          trvId: id,
+          targetTemp: wantedTemp,
+          label: currentActionLabel + " [Retry]"
+        });
+      }
+    }
+
+    print("Prüfung (Runde " + (verifyRound + 1) + "): [" + statusParts.join(" | ") + "]");
+
+    if (missingTasks.length === 0) {
+      print("Alle 3 TRVs bestätigt.");
+      return;
+    }
+
+    if (verifyRound < MAX_VERIFY_ROUNDS) {
+      verifyRound++;
+      print("Fehlende Quittung bei " + missingTasks.length + " TRV(s) -> sende erneut...");
+      callQueue = missingTasks;
+      processQueue(myToken);
+    } else {
+      print("Hinweis: Nicht alle TRVs haben quittiert (BLE-Bus ausgelastet).");
+    }
+  });
+}
+
+function processQueue(myToken) {
+  if (myToken !== dispatchToken) return;
+
+  if (callQueue.length === 0) {
+    print("Befehle abgesetzt -> prüfe Quittungen in " + Math.round(VERIFY_DELAY_MS / 1000) + "s...");
+    verifyTimer = Timer.set(VERIFY_DELAY_MS, false, function () {
+      verifyAndRetry(myToken);
+    });
+    return;
+  }
+
+  // Slot-Schutz: Wenn bereits 2 BLE-Calls noch auf ihre Antwort warten, 3s pausieren
+  if (inFlightCalls >= MAX_IN_FLIGHT_CALLS) {
+    dispatchTimer = Timer.set(3000, false, function () {
+      processQueue(myToken);
+    });
+    return;
+  }
+
   var task = callQueue[0];
   var nextQueue = [];
   for (var i = 1; i < callQueue.length; i++) {
@@ -116,80 +190,83 @@ function processQueue() {
     targetTemp = (typeof savedTargets[key] === "number") ? savedTargets[key] : fallback;
   }
 
-  var attempt = task.attempt || 0;
-  var retryTag = (attempt > 0) ? " (Versuch " + (attempt + 1) + ")" : "";
-  print("TRV " + task.trvId + " -> setze " + task.label + " (" + targetTemp + " °C)" + retryTag + "...");
+  expectedTargets[key] = targetTemp;
+  print("TRV " + task.trvId + " -> sende " + task.label + " (" + targetTemp + " °C)");
 
-  stepCounter++;
-  var myStep = stepCounter;
-
-  // 12-Sekunden-Wächter (verhindert 60s-Blockaden)
-  stepTimer = Timer.set(TRV_STEP_TIMEOUT_MS, false, function () {
-    if (myStep !== stepCounter) return;
-    if (currentTrvTargets[key] === targetTemp) {
-      print("TRV " + task.trvId + ": OK via Status-Cache (" + targetTemp + " °C)");
-      finishStep(myStep, 400);
-    } else if (attempt < MAX_RETRIES) {
-      print("TRV " + task.trvId + ": Keine Quittung nach 12s -> wiederhole...");
-      // Task wieder vorne in die Queue stellen
-      var retryTask = {
-        action: task.action,
-        trvId: task.trvId,
-        targetTemp: targetTemp,
-        label: task.label,
-        attempt: attempt + 1
-      };
-      var reordered = [retryTask];
-      for (var j = 0; j < callQueue.length; j++) {
-        reordered.push(callQueue[j]);
-      }
-      callQueue = reordered;
-      finishStep(myStep, 600);
-    } else {
-      print("TRV " + task.trvId + ": Übersprungen nach Retry (nächster TRV folgt)");
-      finishStep(myStep, 400);
-    }
-  });
-
+  inFlightCalls++;
   Shelly.call("BluTrv.Call", {
     id: task.trvId,
     method: "TRV.SetTarget",
     params: { id: 0, target_C: targetTemp }
   }, function (res, errCode, errMsg) {
-    if (myStep !== stepCounter) return; // Späte Antwort nach Ablauf des 12s-Wächters ignorieren
-    if (errCode === 0) {
+    inFlightCalls = Math.max(0, inFlightCalls - 1);
+    if (myToken === dispatchToken && errCode === 0 && expectedTargets[key] === targetTemp) {
+      ackedTrvs[key] = true;
       currentTrvTargets[key] = targetTemp;
-      print("TRV " + task.trvId + ": OK (" + targetTemp + " °C)");
-      finishStep(myStep, 500);
-    } else {
-      print("TRV " + task.trvId + ": Fehler (" + errMsg + ")");
-      finishStep(myStep, 500);
+      print("TRV " + task.trvId + ": Quittung OK (" + targetTemp + " °C)");
+    } else if (myToken === dispatchToken && errCode !== 0) {
+      print("TRV " + task.trvId + ": RPC-Meldung '" + errMsg + "'");
     }
   });
+
+  if (callQueue.length > 0) {
+    dispatchTimer = Timer.set(STEP_DELAY_MS, false, function () {
+      processQueue(myToken);
+    });
+  } else {
+    processQueue(myToken);
+  }
 }
 
 function enqueueAll(action, targetTemp, label) {
-  stepCounter++; // Laufenden Schritt invalidieren
-  if (stepTimer !== null) {
-    Timer.clear(stepTimer);
-    stepTimer = null;
+  dispatchToken++;
+  if (dispatchTimer !== null) {
+    Timer.clear(dispatchTimer);
+    dispatchTimer = null;
   }
+  if (verifyTimer !== null) {
+    Timer.clear(verifyTimer);
+    verifyTimer = null;
+  }
+
+  ackedTrvs = {};
+  expectedTargets = {};
+  currentActionLabel = label;
+  verifyRound = 0;
   callQueue = [];
+
   for (var i = 0; i < TRV_IDS.length; i++) {
     callQueue.push({
       action: action,
       trvId: TRV_IDS[i],
       targetTemp: targetTemp,
-      label: label,
-      attempt: 0
+      label: label
     });
   }
-  processQueue();
+  processQueue(dispatchToken);
 }
 
 // Aktuelle Solltemperaturen sofort aus dem lokalen Gateway-Cache sichern (0 ms, kein Funk)
 function snapshotCurrentTargetsFromGateway(callback) {
+  if (inFlightCalls > MAX_IN_FLIGHT_CALLS) {
+    // Fallback aus lokalem Script-Cache, falls Gateway-RPC gerade voll ist
+    for (var j = 0; j < TRV_IDS.length; j++) {
+      var k = String(TRV_IDS[j]);
+      if (typeof currentTrvTargets[k] === "number") {
+        savedTargets[k] = currentTrvTargets[k];
+      } else if (typeof savedTargets[k] !== "number") {
+        savedTargets[k] = isKomfort ? tempKomfort : tempEco;
+      }
+      print("TRV " + TRV_IDS[j] + ": Sollwert " + savedTargets[k] + " °C (Cache) gesichert");
+    }
+    saveState();
+    if (callback) callback();
+    return;
+  }
+
+  inFlightCalls++;
   Shelly.call("Shelly.GetStatus", {}, function (res) {
+    inFlightCalls = Math.max(0, inFlightCalls - 1);
     for (var i = 0; i < TRV_IDS.length; i++) {
       var id = TRV_IDS[i];
       var key = String(id);
@@ -328,6 +405,9 @@ Shelly.addStatusHandler(function (event) {
   if (event.component.indexOf("bthomedevice:") === 0 && event.delta && typeof event.delta.target_C === "number") {
     var trvKey = event.component.split(":")[1];
     currentTrvTargets[trvKey] = event.delta.target_C;
+    if (expectedTargets[trvKey] === event.delta.target_C) {
+      ackedTrvs[trvKey] = true;
+    }
     return;
   }
 
@@ -407,7 +487,12 @@ function onBleScan(event, result) {
         var nextKomfort = !isKomfort;
         print("Taster gedrückt -> Wechsle zu " + (nextKomfort ? "Komfort" : "Eco"));
         applyModeChange(nextKomfort);
-        Shelly.call("Boolean.Set", { id: SWITCH_ID, value: nextKomfort });
+        if (inFlightCalls <= MAX_IN_FLIGHT_CALLS) {
+          inFlightCalls++;
+          Shelly.call("Boolean.Set", { id: SWITCH_ID, value: nextKomfort }, function () {
+            inFlightCalls = Math.max(0, inFlightCalls - 1);
+          });
+        }
       }
     }
   } else if (mac === WIN1_MAC) {
@@ -442,7 +527,9 @@ if (BLE.Scanner.isRunning && !BLE.Scanner.isRunning()) {
 
 // === START-INITIALISIERUNG ===
 loadState();
+inFlightCalls++;
 Shelly.call("Shelly.GetStatus", {}, function (res) {
+  inFlightCalls = Math.max(0, inFlightCalls - 1);
   if (res) {
     var sw = res["boolean:" + SWITCH_ID];
     if (sw && typeof sw.value === "boolean") {
