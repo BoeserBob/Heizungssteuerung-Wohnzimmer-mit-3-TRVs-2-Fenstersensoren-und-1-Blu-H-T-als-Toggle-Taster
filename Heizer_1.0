@@ -1,13 +1,15 @@
-/**
+//**
  * Shelly BLU Gateway Gen3 – Wohnzimmer Heizungssteuerung
  * SPDX-License-Identifier: BSL-1.0
  * Licensed under the Boost Software License 1.0 (https://www.boost.org/LICENSE_1_0.txt).
  *
  * Funktion:
- * Steuert 3x Shelly BLU TRV lokal anhand von Zeitplänen, 2 Fenstersensoren
- * und einem Hauptschalter (synchronisiert über BLU-Taster & App-Widget).
- * - Hauptschalter AUS oder min. 1 Fenster OFFEN -> Zeitpläne aus, TRVs auf 5 °C.
- * - Hauptschalter AN und alle Fenster ZU -> Lokale TRV-Zeitpläne wieder aktiv.
+ * Steuert 3x Shelly BLU TRV lokal anhand von 2 Fenstersensoren und einem
+ * Hauptschalter (synchronisiert über BLU-Taster & App-Widget).
+ * - Hauptschalter AUS oder min. 1 Fenster OFFEN -> Aktuelle TRV-Sollwerte sichern,
+ *   danach alle TRVs auf 5 °C absenken.
+ * - Hauptschalter AN und alle Fenster ZU -> Jeden TRV auf seinen individuellen
+ *   vorherigen Sollwert zurücksetzen (unabhängig von Zeitplänen).
  *
  * Komponenten:
  * - Gateway:         Shelly BLU Gateway Gen3 (S3GW-1DBT001)
@@ -18,42 +20,58 @@
  */
 
 // === KONFIGURATION ===
-var BLU_BUTTON_MAC   = "7c:c6:b6:80:05:7a"; // Taster (BLU H&T / BLU Button)
-var WIN1_MAC         = "f4:01:cc:21:d9:4f"; // Fenster Küche
-var WIN2_MAC         = "f4:01:cc:21:dd:02"; // Wozi Fenster links
+var BLU_BUTTON_MAC       = "7c:c6:b6:80:05:7a"; // Taster (BLU H&T / BLU Button)
+var WIN1_MAC             = "f4:01:cc:21:d9:4f"; // Fenster Küche
+var WIN2_MAC             = "f4:01:cc:21:dd:02"; // Wozi Fenster links
 
-var SWITCH_ID        = 200;              // boolean:200 (Wozi Heizung)
-var TRV_IDS          = [200, 201, 202];  // bthomedevice:200, 201, 202
-var LOG_INTERVAL_SEC = 300;              // Zyklischer Log in Sekunden (300 = 5 Min., 0 = aus)
+var SWITCH_ID            = 200;              // boolean:200 (Wozi Heizung)
+var TRV_IDS              = [200, 201, 202];  // bthomedevice:200, 201, 202
+var REDUCED_TEMP         = 5;                // Absenktemperatur in °C
+var DEFAULT_RESTORE_TEMP = 20;               // Fallback-Temperatur, falls noch kein Wert gespeichert
+var LOG_INTERVAL_SEC     = 300;              // Zyklischer Log in Sekunden (300 = 5 Min., 0 = aus)
 
-// Zustandsspeicher & RPC-Warteschlange
+// Zustandsspeicher
 var heatingEnabled = false;
 var win1Open = false;
 var win2Open = false;
+var isReduced = false;
+var savedTargets = {}; // z.B. { "200": 21.5, "201": 20.0, "202": 19.0 }
+var reducedTrvs  = {}; // Merkt sich, welche TRVs tatsächlich abgesenkt wurden
+
 var lastBtnPkt = -1;
 var lastWin1Pkt = -1;
 var lastWin2Pkt = -1;
 var lastWin1Ms = -1;
 var lastWin2Ms = -1;
+var encWarned = {};
 
 var callQueue = [];
 var isCalling = false;
 
-// === 1. ZENTRALE HEIZUNGSLOGIK & SEQUENZIELLE RPC-QUEUE ===
-function updateHeating() {
-  if (!heatingEnabled) {
-    print("Heizung AUS -> Zeitplan aus, TRVs auf 5 °C");
-    setAllBluTrvs(false);
-  } else if (win1Open || win2Open) {
-    print("Fenster OFFEN -> Pause, TRVs auf 5 °C");
-    setAllBluTrvs(false);
-  } else {
-    print("Heizung AN & beide Fenster ZU -> Zeitplan aktiv");
-    setAllBluTrvs(true);
-  }
+// === PERSISTENZ (Zustand über Neustarts hinweg sichern) ===
+function saveState() {
+  try {
+    Script.storage.setItem("wozi_trv_state", JSON.stringify({
+      isReduced: isReduced,
+      savedTargets: savedTargets,
+      reducedTrvs: reducedTrvs
+    }));
+  } catch (e) {}
 }
 
-// Führt immer nur einen Bluetooth-RPC-Call nach dem anderen aus
+function loadState() {
+  try {
+    var raw = Script.storage.getItem("wozi_trv_state");
+    if (raw) {
+      var data = JSON.parse(raw);
+      if (typeof data.isReduced === "boolean") isReduced = data.isReduced;
+      if (data.savedTargets) savedTargets = data.savedTargets;
+      if (data.reducedTrvs) reducedTrvs = data.reducedTrvs;
+    }
+  } catch (e) {}
+}
+
+// === 1. SEQUENZIELLE BLUETOOTH-RPC-WARTESCHLANGE ===
 function processQueue() {
   if (callQueue.length === 0) {
     isCalling = false;
@@ -67,44 +85,95 @@ function processQueue() {
   }
   callQueue = nextQueue;
 
-  Shelly.call("BluTrv.Call", task, function (res, errCode, errMsg) {
-    if (errCode !== 0) {
-      print("TRV " + task.id + " Fehler (" + task.method + "): " + errMsg);
-    }
-    processQueue();
-  });
+  if (task.action === "READ_AND_REDUCE") {
+    // Schritt 1: Aktuelle Zieltemperatur des TRV auslesen
+    Shelly.call("BluTrv.Call", {
+      id: task.trvId,
+      method: "TRV.GetStatus",
+      params: { id: 0 }
+    }, function (res, errCode, errMsg) {
+      var key = String(task.trvId);
+      if (errCode === 0 && res && typeof res.target_C === "number") {
+        // Nur sichern, falls dieser TRV nicht bereits abgesenkt war
+        if (!reducedTrvs[key]) {
+          savedTargets[key] = res.target_C;
+        }
+        print("TRV " + task.trvId + ": vorherige Soll-Temp " + savedTargets[key] + " °C gesichert");
+      } else {
+        if (typeof savedTargets[key] !== "number") {
+          savedTargets[key] = DEFAULT_RESTORE_TEMP;
+        }
+        print("TRV " + task.trvId + ": Status nicht lesbar (" + errMsg + "), nutze Fallback " + savedTargets[key] + " °C");
+      }
+
+      // Schritt 2: TRV auf Absenktemperatur (5 °C) fahren
+      Shelly.call("BluTrv.Call", {
+        id: task.trvId,
+        method: "TRV.SetTarget",
+        params: { id: 0, target_C: REDUCED_TEMP }
+      }, function (res2, errCode2, errMsg2) {
+        if (errCode2 === 0) {
+          reducedTrvs[key] = true;
+          saveState();
+        } else {
+          print("TRV " + task.trvId + " Fehler beim Absenken: " + errMsg2);
+        }
+        processQueue();
+      });
+    });
+
+  } else if (task.action === "RESTORE") {
+    var key = String(task.trvId);
+    var restoreTemp = (typeof savedTargets[key] === "number") ? savedTargets[key] : DEFAULT_RESTORE_TEMP;
+
+    Shelly.call("BluTrv.Call", {
+      id: task.trvId,
+      method: "TRV.SetTarget",
+      params: { id: 0, target_C: restoreTemp }
+    }, function (res, errCode, errMsg) {
+      if (errCode === 0) {
+        reducedTrvs[key] = false;
+        saveState();
+        print("TRV " + task.trvId + ": zurückgesetzt auf " + restoreTemp + " °C");
+      } else {
+        print("TRV " + task.trvId + " Fehler beim Wiederherstellen: " + errMsg);
+      }
+      processQueue();
+    });
+  }
 }
 
-// Reiht die Befehle für alle 3 Shelly BLU TRVs sauber in die Queue ein
-function setAllBluTrvs(active) {
+function enqueueTrvAction(action) {
   callQueue = []; // Noch nicht gestartete alte Befehle verwerfen
   for (var i = 0; i < TRV_IDS.length; i++) {
-    var trvId = TRV_IDS[i];
-    if (active) {
-      callQueue.push({
-        id: trvId,
-        method: "TRV.SetConfig",
-        params: { id: 0, config: { enable: true } }
-      });
-    } else {
-      callQueue.push({
-        id: trvId,
-        method: "TRV.SetConfig",
-        params: { id: 0, config: { enable: false } }
-      });
-      callQueue.push({
-        id: trvId,
-        method: "TRV.SetTarget",
-        params: { id: 0, target_C: 5 }
-      });
-    }
+    callQueue.push({ action: action, trvId: TRV_IDS[i] });
   }
   if (!isCalling) {
     processQueue();
   }
 }
 
-// === 2. ZYKLISCHER STATUS-LOG ===
+// === 2. ZENTRALE HEIZUNGSLOGIK ===
+function updateHeating() {
+  var shouldReduce = (!heatingEnabled || win1Open || win2Open);
+
+  if (shouldReduce && !isReduced) {
+    isReduced = true;
+    saveState();
+    print(!heatingEnabled
+      ? "Heizung AUS -> Sollwerte sichern & auf " + REDUCED_TEMP + " °C absenken"
+      : "Fenster OFFEN -> Sollwerte sichern & auf " + REDUCED_TEMP + " °C absenken");
+    enqueueTrvAction("READ_AND_REDUCE");
+
+  } else if (!shouldReduce && isReduced) {
+    isReduced = false;
+    saveState();
+    print("Heizung AN & beide Fenster ZU -> Vorherige Sollwerte wiederherstellen");
+    enqueueTrvAction("RESTORE");
+  }
+}
+
+// === 3. ZYKLISCHER STATUS-LOG ===
 function formatAge(lastMs) {
   if (lastMs < 0) return "kein Signal";
   var diffSec = Math.round((Shelly.getUptimeMs() - lastMs) / 1000);
@@ -114,15 +183,15 @@ function formatAge(lastMs) {
 
 function logStatus() {
   var mode = !heatingEnabled
-    ? "AUS (5 °C)"
-    : (win1Open || win2Open ? "PAUSE Fenster offen (5 °C)" : "AKTIV (Zeitplan)");
+    ? "AUS (" + REDUCED_TEMP + " °C)"
+    : (win1Open || win2Open ? "PAUSE Fenster offen (" + REDUCED_TEMP + " °C)" : "AKTIV (vorherige Sollwerte)");
 
   print(
     "[STATUS] Schalter: " + (heatingEnabled ? "AN" : "AUS") +
     " | Modus: " + mode +
     " | Küche: " + (win1Open ? "OFFEN" : "ZU") + " (" + formatAge(lastWin1Ms) + ")" +
     " | Wozi links: " + (win2Open ? "OFFEN" : "ZU") + " (" + formatAge(lastWin2Ms) + ")" +
-    " | Queue: " + callQueue.length
+    " | Gesichert: " + JSON.stringify(savedTargets)
   );
 }
 
@@ -130,38 +199,51 @@ if (LOG_INTERVAL_SEC > 0) {
   Timer.set(LOG_INTERVAL_SEC * 1000, true, logStatus);
 }
 
-// === 3. HAUPTSCHALTER (WIDGET & TASTER) ÜBERWACHEN ===
+// === 4. HAUPTSCHALTER (WIDGET & TASTER) ÜBERWACHEN ===
 Shelly.addStatusHandler(function (event) {
   if (event.component === "boolean:" + SWITCH_ID && event.delta && typeof event.delta.value === "boolean") {
     heatingEnabled = event.delta.value;
+    print("Hauptschalter geändert auf: " + (heatingEnabled ? "AN" : "AUS"));
     updateHeating();
   }
 });
 
-// === 4. BTHOME-SCANNER FÜR TASTER & BLU-FENSTERSENSOREN ===
-function parseBTHome(rawHex, lastPkt) {
+// === 5. BTHOME-SCANNER FÜR TASTER & BLU-FENSTERSENSOREN ===
+function parseBTHome(rawHex, lastPkt, mac) {
   var res = { valid: false, pktId: lastPkt, button: false, windowOpen: null };
   if (!rawHex || rawHex.length < 4) return res;
+
+  // Prüfen, ob BTHome-Verschlüsselung (Bit 0 in Byte 0) aktiv ist
+  var devInfo = parseInt(rawHex.substr(0, 2), 16);
+  if ((devInfo & 0x01) !== 0) {
+    if (!encWarned[mac]) {
+      encWarned[mac] = true;
+      print("WARNUNG: Gerät " + mac + " sendet verschlüsselt! Bitte in der Shelly BLU App 'Encryption' deaktivieren.");
+    }
+    return res;
+  }
 
   var idx = 2;
   while (idx + 2 <= rawHex.length) {
     var objId = parseInt(rawHex.substr(idx, 2), 16);
     if (objId === 0x00 && idx + 4 <= rawHex.length) {
       var pktId = parseInt(rawHex.substr(idx + 2, 2), 16);
-      if (pktId === lastPkt) return res;
+      if (pktId === lastPkt) return res; // Duplikat ignorieren
       res.pktId = pktId;
       res.valid = true;
       idx += 4;
     } else if (objId === 0x3A && idx + 4 <= rawHex.length) {
       if (parseInt(rawHex.substr(idx + 2, 2), 16) > 0) res.button = true;
       idx += 4;
-    } else if ((objId === 0x2D || objId === 0x11) && idx + 4 <= rawHex.length) {
+    } else if ((objId === 0x2D || objId === 0x11 || objId === 0x1A) && idx + 4 <= rawHex.length) {
       res.windowOpen = parseInt(rawHex.substr(idx + 2, 2), 16) > 0;
       idx += 4;
-    } else if (objId === 0x01 || objId === 0x05 || objId === 0x15 || objId === 0x21) {
-      idx += 4;
-    } else if (objId === 0x02 || objId === 0x03 || objId === 0x2E || objId === 0x3F || objId === 0x45) {
-      idx += 6;
+    } else if (objId === 0x01 || objId === 0x15 || objId === 0x20 || objId === 0x21 || objId === 0x2E || objId === 0x46) {
+      idx += 4; // 1-Byte Werte
+    } else if (objId === 0x02 || objId === 0x03 || objId === 0x3F || objId === 0x40 || objId === 0x41 || objId === 0x43 || objId === 0x44 || objId === 0x45 || objId === 0x51 || objId === 0x52) {
+      idx += 6; // 2-Byte Werte
+    } else if (objId === 0x05 || objId === 0x42) {
+      idx += 8; // 3-Byte Werte (z. B. 0x05 Helligkeit bei BLU Door/Window!)
     } else {
       break;
     }
@@ -169,9 +251,11 @@ function parseBTHome(rawHex, lastPkt) {
   return res;
 }
 
-BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false }, function (event, result) {
+function onBleScan(event, result) {
   if (event !== BLE.Scanner.SCAN_RESULT || !result || !result.addr) return;
   var mac = result.addr.toLowerCase();
+  if (mac !== BLU_BUTTON_MAC && mac !== WIN1_MAC && mac !== WIN2_MAC) return;
+
   var bthomeData = result.service_data ? result.service_data["fcd2"] : null;
   if (!bthomeData) return;
 
@@ -182,7 +266,7 @@ BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false }, fun
   }
 
   if (mac === BLU_BUTTON_MAC) {
-    var btnData = parseBTHome(hex, lastBtnPkt);
+    var btnData = parseBTHome(hex, lastBtnPkt, mac);
     if (btnData.valid) {
       lastBtnPkt = btnData.pktId;
       if (btnData.button) {
@@ -192,7 +276,7 @@ BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false }, fun
     }
   } else if (mac === WIN1_MAC) {
     lastWin1Ms = Shelly.getUptimeMs();
-    var w1Data = parseBTHome(hex, lastWin1Pkt);
+    var w1Data = parseBTHome(hex, lastWin1Pkt, mac);
     if (w1Data.valid) {
       lastWin1Pkt = w1Data.pktId;
       if (w1Data.windowOpen !== null && w1Data.windowOpen !== win1Open) {
@@ -203,7 +287,7 @@ BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false }, fun
     }
   } else if (mac === WIN2_MAC) {
     lastWin2Ms = Shelly.getUptimeMs();
-    var w2Data = parseBTHome(hex, lastWin2Pkt);
+    var w2Data = parseBTHome(hex, lastWin2Pkt, mac);
     if (w2Data.valid) {
       lastWin2Pkt = w2Data.pktId;
       if (w2Data.windowOpen !== null && w2Data.windowOpen !== win2Open) {
@@ -213,12 +297,20 @@ BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false }, fun
       }
     }
   }
-});
+}
 
-// Beim Start aktuellen Zustand von boolean:200 laden
+// An laufenden BLE-Scanner anhängen (oder starten, falls noch inaktiv)
+BLE.Scanner.Subscribe(onBleScan);
+if (BLE.Scanner.isRunning && !BLE.Scanner.isRunning()) {
+  BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false });
+}
+
+// === START-INITIALISIERUNG ===
+loadState();
 Shelly.call("Boolean.GetStatus", { id: SWITCH_ID }, function (res) {
   if (res && typeof res.value === "boolean") {
     heatingEnabled = res.value;
     updateHeating();
+    Timer.set(2000, false, logStatus);
   }
 });
