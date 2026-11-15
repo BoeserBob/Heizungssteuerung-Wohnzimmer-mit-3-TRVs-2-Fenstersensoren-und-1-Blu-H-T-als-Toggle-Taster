@@ -18,12 +18,13 @@
  */
 
 // === KONFIGURATION ===
-var BLU_BUTTON_MAC = "7c:c6:b6:80:05:7a"; // Taster (BLU H&T / BLU Button)
-var WIN1_MAC       = "f4:01:cc:21:d9:4f"; // Fenster Küche
-var WIN2_MAC       = "f4:01:cc:21:dd:02"; // Wozi Fenster links
+var BLU_BUTTON_MAC   = "7c:c6:b6:80:05:7a"; // Taster (BLU H&T / BLU Button)
+var WIN1_MAC         = "f4:01:cc:21:d9:4f"; // Fenster Küche
+var WIN2_MAC         = "f4:01:cc:21:dd:02"; // Wozi Fenster links
 
-var SWITCH_ID = 200;              // boolean:200 (Wozi Heizung)
-var TRV_IDS   = [200, 201, 202];  // bthomedevice:200, 201, 202
+var SWITCH_ID        = 200;              // boolean:200 (Wozi Heizung)
+var TRV_IDS          = [200, 201, 202];  // bthomedevice:200, 201, 202
+var LOG_INTERVAL_SEC = 300;              // Zyklischer Log in Sekunden (300 = 5 Min., 0 = aus)
 
 // Zustandsspeicher & RPC-Warteschlange
 var heatingEnabled = false;
@@ -32,6 +33,8 @@ var win2Open = false;
 var lastBtnPkt = -1;
 var lastWin1Pkt = -1;
 var lastWin2Pkt = -1;
+var lastWin1Ms = -1;
+var lastWin2Ms = -1;
 
 var callQueue = [];
 var isCalling = false;
@@ -101,7 +104,33 @@ function setAllBluTrvs(active) {
   }
 }
 
-// === 2. HAUPTSCHALTER (WIDGET & TASTER) ÜBERWACHEN ===
+// === 2. ZYKLISCHER STATUS-LOG ===
+function formatAge(lastMs) {
+  if (lastMs < 0) return "kein Signal";
+  var diffSec = Math.round((Shelly.getUptimeMs() - lastMs) / 1000);
+  if (diffSec < 60) return "vor " + diffSec + "s";
+  return "vor " + Math.round(diffSec / 60) + "m";
+}
+
+function logStatus() {
+  var mode = !heatingEnabled
+    ? "AUS (5 °C)"
+    : (win1Open || win2Open ? "PAUSE Fenster offen (5 °C)" : "AKTIV (Zeitplan)");
+
+  print(
+    "[STATUS] Schalter: " + (heatingEnabled ? "AN" : "AUS") +
+    " | Modus: " + mode +
+    " | Küche: " + (win1Open ? "OFFEN" : "ZU") + " (" + formatAge(lastWin1Ms) + ")" +
+    " | Wozi links: " + (win2Open ? "OFFEN" : "ZU") + " (" + formatAge(lastWin2Ms) + ")" +
+    " | Queue: " + callQueue.length
+  );
+}
+
+if (LOG_INTERVAL_SEC > 0) {
+  Timer.set(LOG_INTERVAL_SEC * 1000, true, logStatus);
+}
+
+// === 3. HAUPTSCHALTER (WIDGET & TASTER) ÜBERWACHEN ===
 Shelly.addStatusHandler(function (event) {
   if (event.component === "boolean:" + SWITCH_ID && event.delta && typeof event.delta.value === "boolean") {
     heatingEnabled = event.delta.value;
@@ -109,7 +138,7 @@ Shelly.addStatusHandler(function (event) {
   }
 });
 
-// === 3. BTHOME-SCANNER FÜR TASTER & BLU-FENSTERSENSOREN ===
+// === 4. BTHOME-SCANNER FÜR TASTER & BLU-FENSTERSENSOREN ===
 function parseBTHome(rawHex, lastPkt) {
   var res = { valid: false, pktId: lastPkt, button: false, windowOpen: null };
   if (!rawHex || rawHex.length < 4) return res;
@@ -162,6 +191,7 @@ BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false }, fun
       }
     }
   } else if (mac === WIN1_MAC) {
+    lastWin1Ms = Shelly.getUptimeMs();
     var w1Data = parseBTHome(hex, lastWin1Pkt);
     if (w1Data.valid) {
       lastWin1Pkt = w1Data.pktId;
@@ -172,6 +202,7 @@ BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false }, fun
       }
     }
   } else if (mac === WIN2_MAC) {
+    lastWin2Ms = Shelly.getUptimeMs();
     var w2Data = parseBTHome(hex, lastWin2Pkt);
     if (w2Data.valid) {
       lastWin2Pkt = w2Data.pktId;
