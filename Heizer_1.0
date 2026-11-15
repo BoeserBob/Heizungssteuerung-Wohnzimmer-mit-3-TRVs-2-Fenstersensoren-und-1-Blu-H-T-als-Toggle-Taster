@@ -60,7 +60,7 @@ function processQ(token) {
 
   if (ST.q.length === 0) {
     print("Prüfe Quittungen in " + Math.round(CFG.T_VERIF / 1000) + "s...");
-    ST.tV = Timer.set(CFG.T_VERIF, false, function () { verifyQ(token); });
+    ST.tV = Timer.set(CFG.T_VERIF, false, function () { ST.tV = null; verifyQ(token); });
     return;
   }
 
@@ -95,7 +95,7 @@ function processQ(token) {
 function verifyQ(token) {
   if (token !== ST.token) return;
   if (ST.inFlight >= CFG.MAX_CALLS) {
-    ST.tV = Timer.set(5000, false, function () { verifyQ(token); });
+    ST.tV = Timer.set(5000, false, function () { ST.tV = null; verifyQ(token); });
     return;
   }
 
@@ -137,8 +137,8 @@ function verifyQ(token) {
 
 function enqueueAll(tempObj, lbl) {
   ST.token++; ST.retries = 0; ST.expected = {}; ST.acked = {}; ST.q = [];
-  if (ST.tQ) Timer.clear(ST.tQ);
-  if (ST.tV) Timer.clear(ST.tV);
+  if (ST.tQ) { Timer.clear(ST.tQ); ST.tQ = null; }
+  if (ST.tV) { Timer.clear(ST.tV); ST.tV = null; }
 
   for (var i = 0; i < CFG.TRVS.length; i++) {
     var id = CFG.TRVS[i];
@@ -153,17 +153,33 @@ function updateLogic() {
   var open = ST.w1 || ST.w2;
 
   if (open && !ST.over) {
-    ST.over = true; ST.modePend = false;
-    callRpc("Shelly.GetStatus", {}, function (res) {
+    var switchingInProgress = (ST.q.length > 0 || ST.tV !== null);
+    ST.over = true;
+    ST.modePend = false;
+
+    if (switchingInProgress) {
+      // Laufender Modus-Wechsel: gewählte Zieltemperatur direkt für alle TRVs sichern
+      var targetModeTemp = ST.komf ? TEMPS.komf : TEMPS.eco;
       for (var i = 0; i < CFG.TRVS.length; i++) {
-        var id = CFG.TRVS[i];
-        var statusTemp = getTrvTargetFromStatus(res, id);
-        ST.targets[id] = (statusTemp !== null) ? statusTemp : (ST.cache[id] || (ST.komf ? TEMPS.komf : TEMPS.eco));
-        print("TRV " + id + ": Sollwert " + ST.targets[id] + " °C gesichert");
+        ST.targets[CFG.TRVS[i]] = targetModeTemp;
       }
       saveState();
+      print("Umschaltung lief noch -> Zielwert " + targetModeTemp + " °C für alle TRVs gesichert");
       enqueueAll(TEMPS.lueft, "Lueften");
-    });
+    } else {
+      // Ruhiger Betrieb: individuelle Sollwerte der TRVs auslesen und sichern
+      callRpc("Shelly.GetStatus", {}, function (res) {
+        if (!ST.over) return; // Falls Fenster schon wieder geschlossen wurde
+        for (var i = 0; i < CFG.TRVS.length; i++) {
+          var id = CFG.TRVS[i];
+          var statusTemp = getTrvTargetFromStatus(res, id);
+          ST.targets[id] = (statusTemp !== null) ? statusTemp : (ST.cache[id] || (ST.komf ? TEMPS.komf : TEMPS.eco));
+          print("TRV " + id + ": Sollwert " + ST.targets[id] + " °C gesichert");
+        }
+        saveState();
+        enqueueAll(TEMPS.lueft, "Lueften");
+      });
+    }
   } else if (!open && ST.over) {
     ST.over = false;
     if (ST.modePend) {
