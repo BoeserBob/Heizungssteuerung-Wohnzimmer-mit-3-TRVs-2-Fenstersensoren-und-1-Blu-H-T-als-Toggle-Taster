@@ -17,7 +17,7 @@
  * - Fenstersensoren: Küche (f4:01:cc:21:d9:4f), Wozi links (f4:01:cc:21:dd:02)
  */
 
-// === KONFIGURATION (komplett eingetragen) ===
+// === KONFIGURATION ===
 var BLU_BUTTON_MAC = "7c:c6:b6:80:05:7a"; // Taster (BLU H&T / BLU Button)
 var WIN1_MAC       = "f4:01:cc:21:d9:4f"; // Fenster Küche
 var WIN2_MAC       = "f4:01:cc:21:dd:02"; // Wozi Fenster links
@@ -25,7 +25,7 @@ var WIN2_MAC       = "f4:01:cc:21:dd:02"; // Wozi Fenster links
 var SWITCH_ID = 200;              // boolean:200 (Wozi Heizung)
 var TRV_IDS   = [200, 201, 202];  // bthomedevice:200, 201, 202
 
-// Zustandsspeicher
+// Zustandsspeicher & RPC-Warteschlange
 var heatingEnabled = false;
 var win1Open = false;
 var win2Open = false;
@@ -33,7 +33,10 @@ var lastBtnPkt = -1;
 var lastWin1Pkt = -1;
 var lastWin2Pkt = -1;
 
-// === 1. ZENTRALE HEIZUNGSLOGIK ===
+var callQueue = [];
+var isCalling = false;
+
+// === 1. ZENTRALE HEIZUNGSLOGIK & SEQUENZIELLE RPC-QUEUE ===
 function updateHeating() {
   if (!heatingEnabled) {
     print("Heizung AUS -> Zeitplan aus, TRVs auf 5 °C");
@@ -47,28 +50,54 @@ function updateHeating() {
   }
 }
 
-// Steuert alle 3 Shelly BLU TRVs direkt lokal per RPC
+// Führt immer nur einen Bluetooth-RPC-Call nach dem anderen aus
+function processQueue() {
+  if (callQueue.length === 0) {
+    isCalling = false;
+    return;
+  }
+  isCalling = true;
+  var task = callQueue[0];
+  var nextQueue = [];
+  for (var i = 1; i < callQueue.length; i++) {
+    nextQueue.push(callQueue[i]);
+  }
+  callQueue = nextQueue;
+
+  Shelly.call("BluTrv.Call", task, function (res, errCode, errMsg) {
+    if (errCode !== 0) {
+      print("TRV " + task.id + " Fehler (" + task.method + "): " + errMsg);
+    }
+    processQueue();
+  });
+}
+
+// Reiht die Befehle für alle 3 Shelly BLU TRVs sauber in die Queue ein
 function setAllBluTrvs(active) {
+  callQueue = []; // Noch nicht gestartete alte Befehle verwerfen
   for (var i = 0; i < TRV_IDS.length; i++) {
     var trvId = TRV_IDS[i];
     if (active) {
-      Shelly.call("BluTrv.Call", {
+      callQueue.push({
         id: trvId,
         method: "TRV.SetConfig",
         params: { id: 0, config: { enable: true } }
       });
     } else {
-      Shelly.call("BluTrv.Call", {
+      callQueue.push({
         id: trvId,
         method: "TRV.SetConfig",
         params: { id: 0, config: { enable: false } }
       });
-      Shelly.call("BluTrv.Call", {
+      callQueue.push({
         id: trvId,
         method: "TRV.SetTarget",
         params: { id: 0, target_C: 5 }
       });
     }
+  }
+  if (!isCalling) {
+    processQueue();
   }
 }
 
