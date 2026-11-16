@@ -6,6 +6,7 @@
  *   - BLU Button (MAC_BTN):   Manuelles Umschalten Komfort <-> Eco
  *   - BLU Door/Window (W1/W2): Fenster Küche (MAC_W1) & Wohnzimmer (MAC_W2)
  *   - 3x Shelly BLU TRV:      IDs 200, 201, 202
+ *   - Shelly Plus Plug S:     SNPL-00112EU (192.168.188.194) – LED-Ring & Taster
  *   - Virtueller Schalter:    boolean:200 (true = Komfort, false = Eco)
  *   - Virtuelle Zahlen:       number:200 (Komfort °C), number:201 (Eco °C),
  *                             number:202 (Lüften °C)
@@ -20,10 +21,11 @@
  *      - Erst wenn nach 01:00 Uhr mindestens ein Fenster geöffnet wurde
  *        (ventOpened = true) und danach ALLE Fenster wieder geschlossen sind,
  *        schaltet das Skript automatisch auf Komfort (22 °C / boolean:200 = true).
- *   2. Manueller Vorrang (Override):
- *      - Wird Komfort (boolean:200 = true) per BLU-Taster, App oder Kurzbefehl
- *        aktiviert, heizt das Wohnzimmer sofort auf Komforttemperatur und
- *        markiert die Morgen-Lüftung als erledigt (ventDone = true).
+ *   2. Manueller Vorrang (BLU-Taster, Plug-Taster, App, Kurzbefehl):
+ *      - Über den BLU-Button oder den HTTP-Endpunkt (/script/<id>/toggle)
+ *        kann jederzeit zwischen Komfort und Eco umgeschaltet werden.
+ *      - Wird Komfort aktiviert, heizt das Wohnzimmer sofort auf Komforttemperatur
+ *        und markiert die Morgen-Lüftung als erledigt (ventDone = true).
  *   3. Fenster-Überwachung (Lüftungspause im laufenden Betrieb):
  *      - Öffnet ein Fenster, werden die aktuellen TRV-Sollwerte persistent
  *        gesichert (Script.storage) und alle TRVs auf Lüftungstemperatur
@@ -33,6 +35,11 @@
  *      - Sendet Zieltemperaturen gestaffelt (T_STEP = 4s, max. 2 parallele
  *        RPC-Aufrufe) an die 3 BLU TRVs und prüft nach 20s (T_VERIF) die
  *        Quittungen inkl. automatischem Wiederholungsversuch (MAX_RETRIES).
+ *   5. LED-Farbringsteuerung am Shelly Plus Plug S:
+ *      - Zeigt den Betriebszustand farbig an: Orange = Komfort, Grün = Eco,
+ *        Eisblau = Lüften.
+ *      - Während der Stell- und Prüfphase der TRVs blinkt der Farbring in der
+ *        Farbe des Zielzustandes und wechselt nach Abschluss auf Dauerlicht.
  * ============================================================================
  */
 
@@ -43,17 +50,29 @@ var CFG = {
   MAC_W2:  "f4:01:cc:21:dd:02",
   TRVS:    [200, 201, 202],
   SW_ID:   200, N_KOMF: 200, N_ECO: 201, N_LUEFT: 202,
+  PLUG_IP: "192.168.188.194",
   RESET_TIME: "01:00",
-  T_STEP:  4000, T_VERIF: 20000, T_CLOCK: 30000, MAX_CALLS: 2, MAX_RETRIES: 1
+  T_STEP:  4000, T_VERIF: 20000, T_CLOCK: 30000, T_BLINK: 900,
+  MAX_CALLS: 2, MAX_RETRIES: 1
 };
 
 var TEMPS = { komf: 22, eco: 16, lueft: 5 };
+
+// RGB-Skala 0..100 für Shelly Plus Plug S (SNPL-00112EU)
+var PLUG_COLORS = {
+  komf:  [100, 28, 0],   // Orange  = Komfort
+  eco:   [0, 100, 0],    // Grün    = Eco
+  lueft: [0, 75, 100],   // Eisblau = Lüften
+  off:   [0, 0, 0]       // Aus (Blink-Pause)
+};
 
 var ST = {
   komf: true, w1: false, w2: false, over: false, modePend: false,
   ventDone: true, ventOpened: false, resetDone: false,
   targets: {}, cache: {}, acked: {}, activePkt: {}, expected: {},
-  inFlight: 0, q: [], tQ: null, tV: null, token: 0, retries: 0
+  inFlight: 0, q: [], tQ: null, tV: null, token: 0, retries: 0,
+  plugMode: "komf", plugBlinking: false, plugBlinkOn: true,
+  tBlink: null, plugInFlight: false, plugNext: null
 };
 
 // === 2. HILFSFUNKTIONEN & PERSISTENZ ===
@@ -97,6 +116,82 @@ function loadState() {
   }
   ST.over = false;
   ST.modePend = false;
+}
+
+// === 2b. SHELLY PLUS PLUG S – FARBRING & BLINKSTEUERUNG ===
+function sendPlugLed(rgb, bri) {
+  if (!CFG.PLUG_IP) return;
+
+  if (ST.plugInFlight) {
+    ST.plugNext = { rgb: rgb, bri: bri };
+    return;
+  }
+
+  ST.plugInFlight = true;
+  var payload = {
+    config: {
+      leds: {
+        mode: "switch",
+        colors: {
+          "switch:0": {
+            on:  { rgb: rgb, brightness: bri },
+            off: { rgb: rgb, brightness: bri }
+          }
+        }
+      }
+    }
+  };
+
+  Shelly.call("HTTP.POST", {
+    url: "http://" + CFG.PLUG_IP + "/rpc/PLUGS_UI.SetConfig",
+    content_type: "application/json",
+    body: JSON.stringify(payload),
+    timeout: 3
+  }, function (res, err, msg) {
+    ST.plugInFlight = false;
+    if (ST.plugNext !== null) {
+      var nxt = ST.plugNext;
+      ST.plugNext = null;
+      sendPlugLed(nxt.rgb, nxt.bri);
+    }
+  });
+}
+
+function startPlugBlink(mode) {
+  ST.plugMode = mode;
+  ST.plugBlinking = true;
+  ST.plugBlinkOn = true;
+
+  if (ST.tBlink) {
+    Timer.clear(ST.tBlink);
+    ST.tBlink = null;
+  }
+
+  var col = PLUG_COLORS[mode] || PLUG_COLORS.eco;
+  sendPlugLed(col, 100);
+
+  ST.tBlink = Timer.set(CFG.T_BLINK, true, function () {
+    if (!ST.plugBlinking) return;
+    ST.plugBlinkOn = !ST.plugBlinkOn;
+    if (ST.plugBlinkOn) {
+      sendPlugLed(PLUG_COLORS[ST.plugMode] || PLUG_COLORS.eco, 100);
+    } else {
+      sendPlugLed(PLUG_COLORS.off, 0);
+    }
+  });
+}
+
+function stopPlugBlink(finalMode) {
+  if (finalMode) ST.plugMode = finalMode;
+  ST.plugBlinking = false;
+  ST.plugBlinkOn = true;
+
+  if (ST.tBlink) {
+    Timer.clear(ST.tBlink);
+    ST.tBlink = null;
+  }
+
+  sendPlugLed(PLUG_COLORS[ST.plugMode] || PLUG_COLORS.eco, 100);
 }
 
 // === 3. STEUERUNG & WARTESCHLANGE ===
@@ -170,12 +265,14 @@ function verifyQ(token) {
 
     if (missing.length === 0) {
       print("Alle TRVs erfolgreich bestätigt.");
+      stopPlugBlink(ST.plugMode);
     } else if (ST.retries < CFG.MAX_RETRIES) {
       ST.retries++;
       ST.q = missing;
       processQ(token);
     } else {
       print("Hinweis: Max Retries erreicht.");
+      stopPlugBlink(ST.plugMode);
     }
   });
 }
@@ -184,6 +281,10 @@ function enqueueAll(tempObj, lbl) {
   ST.token++; ST.retries = 0; ST.expected = {}; ST.acked = {}; ST.q = [];
   if (ST.tQ) { Timer.clear(ST.tQ); ST.tQ = null; }
   if (ST.tV) { Timer.clear(ST.tV); ST.tV = null; }
+
+  // Zielfarbe für das Blinken während der Stellphase bestimmen
+  var targetLed = (lbl === "Lueften") ? "lueft" : (ST.komf ? "komf" : "eco");
+  startPlugBlink(targetLed);
 
   for (var i = 0; i < CFG.TRVS.length; i++) {
     var id = CFG.TRVS[i];
@@ -275,7 +376,22 @@ function applyMode(isKomf) {
   }
 }
 
-// === 4. EVENT & BLUETOOTH HANDLER ===
+// === 4. EVENT, HTTP & BLUETOOTH HANDLER ===
+var toggleEndpointPath = "";
+if (typeof HTTPServer !== "undefined" && HTTPServer.registerEndpoint) {
+  toggleEndpointPath = HTTPServer.registerEndpoint("toggle", function (req, res) {
+    var nK = !ST.komf;
+    print("Plug/HTTP Taster -> Wechsle zu " + (nK ? "Komfort" : "Eco"));
+    applyMode(nK);
+    callRpc("Boolean.Set", { id: CFG.SW_ID, value: nK });
+
+    res.code = 200;
+    res.headers = [["Content-Type", "application/json"]];
+    res.body = JSON.stringify({ ok: true, mode: nK ? "Komfort" : "Eco" });
+    res.send();
+  });
+}
+
 Shelly.addStatusHandler(function (e) {
   if (!e || !e.component) return;
 
@@ -380,6 +496,13 @@ callRpc("Shelly.GetStatus", {}, function (res) {
     var id = CFG.TRVS[i];
     var t = getTrvTargetFromStatus(res, id);
     ST.cache[id] = (t !== null) ? t : (ST.komf ? TEMPS.komf : TEMPS.eco);
+  }
+
+  // Initiale LED-Farbe am Shelly Plus Plug S setzen
+  stopPlugBlink(ST.komf ? "komf" : "eco");
+
+  if (res.wifi && res.wifi.sta_ip && toggleEndpointPath) {
+    print("Plug-Toggle-URL: http://" + res.wifi.sta_ip + toggleEndpointPath);
   }
   print("Skript gestartet. Modus: " + (ST.komf ? "Komfort" : "Eco") + " | Morgen-Lüftung erledigt: " + (ST.ventDone ? "Ja" : "Nein"));
 });
