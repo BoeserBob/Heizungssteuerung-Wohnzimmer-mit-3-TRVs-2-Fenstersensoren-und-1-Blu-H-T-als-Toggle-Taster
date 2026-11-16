@@ -1,0 +1,38 @@
+/**
+ * ============================================================================
+ * Shelly Plus Plug S (Gen 2) – Taster-Hilfsskript (heizung_taster.js)
+ * ============================================================================
+ * Hardware:  Shelly Plus Plug S (SNPL-00112EU, Gen 2, IP: 192.168.188.194)
+ * Ziel:      Shelly BLU Gateway Gen3 (192.168.188.200) -> wozi_heizung.js
+ * Lizenz:    Frei nutzbar / Open Source (analog zu wozi_heizung.js)
+ *
+ * Funktionsübersicht:
+ *   - Überwacht den physischen Taster am Plug im abgetrennten Modus
+ *     (Detached Mode -> switch:0 Event "toggle").
+ *   - Entprellt Mehrfach-Auslösungen (Sperrzeit 1,5 s) und sendet bei jedem
+ *     Tastendruck einen lokalen HTTP-GET-Befehl an den Toggle-Endpunkt des
+ *     Gateways (/script/1/toggle), um zwischen Komfort und Eco zu wechseln.
+ * ============================================================================
+ */
+
+print("gestartet");
+
+var lastPress = 0;
+
+Shelly.addEventHandler(function (e) {
+  if (!e || e.component !== "switch:0" || !e.info || e.info.event !== "toggle") return;
+
+  // Entprellen (ignoriert Mehrfach-Events innerhalb von 1,5 Sekunden)
+  var now = Shelly.getUptimeMs();
+  if (now - lastPress < 1500) return;
+  lastPress = now;
+
+  print("taste gedrueckt");
+  Shelly.call("HTTP.GET", { url: "http://192.168.188.200/script/1/toggle" }, function (res, err, msg) {
+    if (err === 0) {
+      print("url aufgerufen (Code: " + (res ? res.code : "OK") + ")");
+    } else {
+      print("Fehler beim URL-Aufruf: " + msg);
+    }
+  });
+});
