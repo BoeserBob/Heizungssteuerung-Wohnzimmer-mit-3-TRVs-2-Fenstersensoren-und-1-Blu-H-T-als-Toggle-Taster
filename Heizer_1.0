@@ -12,11 +12,12 @@
  *
  * Funktionsübersicht:
  *   1. Morgen-Lüftungs-Freigabe (ohne Sicherheitsnetz):
- *      - Täglich um 23:00 Uhr wird der Lüftungs-Status (ventDone) auf false
- *        zurückgesetzt. Das abendliche Abschalten (Eco) erfolgt per Zeitplan.
+ *      - Täglich um 01:00 Uhr (CFG.RESET_TIME) wird der Lüftungs-Status
+ *        (ventDone) auf false zurückgesetzt. Das abendliche Abschalten (Eco)
+ *        erfolgt per Zeitplan.
  *      - Bleiben die Fenster morgens geschlossen, verharrt die Heizung
  *        dauerhaft auf Eco (16 °C).
- *      - Erst wenn nach 23:00 Uhr mindestens ein Fenster geöffnet wurde
+ *      - Erst wenn nach 01:00 Uhr mindestens ein Fenster geöffnet wurde
  *        (ventOpened = true) und danach ALLE Fenster wieder geschlossen sind,
  *        schaltet das Skript automatisch auf Komfort (22 °C / boolean:200 = true).
  *   2. Manueller Vorrang (Override):
@@ -42,6 +43,7 @@ var CFG = {
   MAC_W2:  "f4:01:cc:21:dd:02",
   TRVS:    [200, 201, 202],
   SW_ID:   200, N_KOMF: 200, N_ECO: 201, N_LUEFT: 202,
+  RESET_TIME: "01:00",
   T_STEP:  4000, T_VERIF: 20000, T_CLOCK: 30000, MAX_CALLS: 2, MAX_RETRIES: 1
 };
 
@@ -232,7 +234,7 @@ function updateLogic() {
   } else if (!open && ST.over) {
     ST.over = false;
 
-    // Erste abgeschlossene Lüftung nach 23:00 Uhr -> Komfortmodus aktivieren
+    // Erste abgeschlossene Lüftung nach 01:00 Uhr -> Komfortmodus aktivieren
     if (!ST.ventDone && ST.ventOpened) {
       ST.ventDone = true;
       ST.ventOpened = false;
@@ -342,18 +344,18 @@ BLE.Scanner.Subscribe(function (ev, res) {
   }
 });
 
-// === 5. ZEITPLAN-RESET (23:00 UHR) & INITIALISIERUNG ===
+// === 5. ZEITPLAN-RESET (01:00 UHR) & INITIALISIERUNG ===
 Timer.set(CFG.T_CLOCK, true, function () {
   var sys = Shelly.getComponentStatus("sys");
   if (!sys || !sys.time) return;
 
-  if (sys.time === "23:00") {
+  if (sys.time === CFG.RESET_TIME) {
     if (!ST.resetDone) {
       ST.ventDone = false;
       ST.ventOpened = false;
       ST.resetDone = true;
       saveState();
-      print("23:00 Uhr: Morgen-Lüftung zurückgesetzt (ventDone = false).");
+      print(CFG.RESET_TIME + " Uhr: Morgen-Lüftung zurückgesetzt (ventDone = false).");
     }
   } else {
     ST.resetDone = false;
