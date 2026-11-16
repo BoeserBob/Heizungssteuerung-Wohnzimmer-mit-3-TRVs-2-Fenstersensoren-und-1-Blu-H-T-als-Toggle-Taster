@@ -52,7 +52,7 @@ var CFG = {
   SW_ID:   200, N_KOMF: 200, N_ECO: 201, N_LUEFT: 202,
   PLUG_IP: "192.168.188.194",
   RESET_TIME: "01:00",
-  T_STEP:  4000, T_VERIF: 20000, T_CLOCK: 30000, T_BLINK: 900,
+  T_STEP:  4000, T_VERIF: 20000, T_CLOCK: 30000, T_BLINK: 2000,
   MAX_CALLS: 2, MAX_RETRIES: 1
 };
 
@@ -168,16 +168,13 @@ function startPlugBlink(mode) {
   }
 
   var col = PLUG_COLORS[mode] || PLUG_COLORS.eco;
-  sendPlugLed(col, 100);
+  sendPlugLed(col, 60);
 
-  ST.tBlink = Timer.set(CFG.T_BLINK, true, function () {
+ST.tBlink = Timer.set(CFG.T_BLINK, true, function () {
     if (!ST.plugBlinking) return;
     ST.plugBlinkOn = !ST.plugBlinkOn;
-    if (ST.plugBlinkOn) {
-      sendPlugLed(PLUG_COLORS[ST.plugMode] || PLUG_COLORS.eco, 100);
-    } else {
-      sendPlugLed(PLUG_COLORS.off, 0);
-    }
+    var col = PLUG_COLORS[ST.plugMode] || PLUG_COLORS.eco;
+    sendPlugLed(col, ST.plugBlinkOn ? 60 : 15);
   });
 }
 
