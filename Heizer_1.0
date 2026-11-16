@@ -363,7 +363,7 @@ Timer.set(CFG.T_CLOCK, true, function () {
 });
 
 if (BLE.Scanner.isRunning && !BLE.Scanner.isRunning()) {
-  BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false });
+  BLE.Scanner.start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false });
 }
 loadState();
 
