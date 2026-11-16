@@ -1,6 +1,38 @@
 /**
- * Shelly BLU Gateway Gen3 – Heizungssteuerung Wohnzimmer
- * Funktion: Steuert 3 TRVs über 2 Fenstersensoren, Taster & App-Slider.
+ * ============================================================================
+ * Shelly BLU Gateway Gen3 – Heizungssteuerung Wohnzimmer (wozi_heizung.js)
+ * ============================================================================
+ * Hardware & Virtuelle Komponenten:
+ *   - BLU Button (MAC_BTN):   Manuelles Umschalten Komfort <-> Eco
+ *   - BLU Door/Window (W1/W2): Fenster Küche (MAC_W1) & Wohnzimmer (MAC_W2)
+ *   - 3x Shelly BLU TRV:      IDs 200, 201, 202
+ *   - Virtueller Schalter:    boolean:200 (true = Komfort, false = Eco)
+ *   - Virtuelle Zahlen:       number:200 (Komfort °C), number:201 (Eco °C),
+ *                             number:202 (Lüften °C)
+ *
+ * Funktionsübersicht:
+ *   1. Morgen-Lüftungs-Freigabe (ohne Sicherheitsnetz):
+ *      - Täglich um 23:00 Uhr wird der Lüftungs-Status (ventDone) auf false
+ *        zurückgesetzt. Das abendliche Abschalten (Eco) erfolgt per Zeitplan.
+ *      - Bleiben die Fenster morgens geschlossen, verharrt die Heizung
+ *        dauerhaft auf Eco (16 °C).
+ *      - Erst wenn nach 23:00 Uhr mindestens ein Fenster geöffnet wurde
+ *        (ventOpened = true) und danach ALLE Fenster wieder geschlossen sind,
+ *        schaltet das Skript automatisch auf Komfort (22 °C / boolean:200 = true).
+ *   2. Manueller Vorrang (Override):
+ *      - Wird Komfort (boolean:200 = true) per BLU-Taster, App oder Kurzbefehl
+ *        aktiviert, heizt das Wohnzimmer sofort auf Komforttemperatur und
+ *        markiert die Morgen-Lüftung als erledigt (ventDone = true).
+ *   3. Fenster-Überwachung (Lüftungspause im laufenden Betrieb):
+ *      - Öffnet ein Fenster, werden die aktuellen TRV-Sollwerte persistent
+ *        gesichert (Script.storage) und alle TRVs auf Lüftungstemperatur
+ *        (5 °C) abgesenkt. Nach dem Schließen werden die gesicherten Werte
+ *        wiederhergestellt.
+ *   4. Sequenzielle Befehlswarteschlange & Verifikation:
+ *      - Sendet Zieltemperaturen gestaffelt (T_STEP = 4s, max. 2 parallele
+ *        RPC-Aufrufe) an die 3 BLU TRVs und prüft nach 20s (T_VERIF) die
+ *        Quittungen inkl. automatischem Wiederholungsversuch (MAX_RETRIES).
+ * ============================================================================
  */
 
 // === 1. KONFIGURATION & ZUSTAND ===
@@ -10,13 +42,14 @@ var CFG = {
   MAC_W2:  "f4:01:cc:21:dd:02",
   TRVS:    [200, 201, 202],
   SW_ID:   200, N_KOMF: 200, N_ECO: 201, N_LUEFT: 202,
-  T_STEP:  4000, T_VERIF: 20000, MAX_CALLS: 2, MAX_RETRIES: 1
+  T_STEP:  4000, T_VERIF: 20000, T_CLOCK: 30000, MAX_CALLS: 2, MAX_RETRIES: 1
 };
 
 var TEMPS = { komf: 22, eco: 16, lueft: 5 };
 
 var ST = {
   komf: true, w1: false, w2: false, over: false, modePend: false,
+  ventDone: true, ventOpened: false, resetDone: false,
   targets: {}, cache: {}, acked: {}, activePkt: {}, expected: {},
   inFlight: 0, q: [], tQ: null, tV: null, token: 0, retries: 0
 };
@@ -41,7 +74,11 @@ function getTrvTargetFromStatus(res, id) {
 
 function saveState() {
   try {
-    Script.storage.setItem("wozi_trv_state", JSON.stringify({ t: ST.targets }));
+    Script.storage.setItem("wozi_trv_state", JSON.stringify({
+      t: ST.targets,
+      vd: ST.ventDone,
+      vo: ST.ventOpened
+    }));
   } catch (e) { print("Fehler beim Speichern: " + e); }
 }
 
@@ -49,7 +86,13 @@ function loadState() {
   try {
     var d = JSON.parse(Script.storage.getItem("wozi_trv_state") || "{}");
     ST.targets = d.t || {};
-  } catch (e) { ST.targets = {}; }
+    ST.ventDone = (typeof d.vd === "boolean") ? d.vd : true;
+    ST.ventOpened = (typeof d.vo === "boolean") ? d.vo : false;
+  } catch (e) {
+    ST.targets = {};
+    ST.ventDone = true;
+    ST.ventOpened = false;
+  }
   ST.over = false;
   ST.modePend = false;
 }
@@ -157,6 +200,12 @@ function updateLogic() {
     ST.over = true;
     ST.modePend = false;
 
+    // Falls Morgen-Lüftung noch aussteht, Öffnen des Fensters vermerken
+    if (!ST.ventDone && !ST.ventOpened) {
+      ST.ventOpened = true;
+      print("Morgen-Lüftung registriert (Fenster geöffnet).");
+    }
+
     if (switchingInProgress) {
       // Laufender Modus-Wechsel: gewählte Zieltemperatur direkt für alle TRVs sichern
       var targetModeTemp = ST.komf ? TEMPS.komf : TEMPS.eco;
@@ -182,7 +231,21 @@ function updateLogic() {
     }
   } else if (!open && ST.over) {
     ST.over = false;
-    if (ST.modePend) {
+
+    // Erste abgeschlossene Lüftung nach 23:00 Uhr -> Komfortmodus aktivieren
+    if (!ST.ventDone && ST.ventOpened) {
+      ST.ventDone = true;
+      ST.ventOpened = false;
+      ST.modePend = false;
+      ST.komf = true;
+      for (var j = 0; j < CFG.TRVS.length; j++) {
+        ST.targets[CFG.TRVS[j]] = TEMPS.komf;
+      }
+      saveState();
+      print("Morgen-Lüftung abgeschlossen -> Aktiviere Komfort (" + TEMPS.komf + " °C).");
+      callRpc("Boolean.Set", { id: CFG.SW_ID, value: true });
+      enqueueAll(TEMPS.komf, "Komfort");
+    } else if (ST.modePend) {
       ST.modePend = false;
       enqueueAll(ST.komf ? TEMPS.komf : TEMPS.eco, ST.komf ? "Komfort" : "Eco");
     } else {
@@ -193,6 +256,15 @@ function updateLogic() {
 
 function applyMode(isKomf) {
   ST.komf = isKomf;
+
+  // Manuelles Umschalten auf Komfort gilt sofort als Freigabe für den Tag
+  if (isKomf && (!ST.ventDone || ST.ventOpened)) {
+    ST.ventDone = true;
+    ST.ventOpened = false;
+    saveState();
+    print("Komfort manuell aktiviert -> Morgen-Lüftung als erledigt markiert.");
+  }
+
   if (ST.over) {
     ST.modePend = true;
     print("Modus gemerkt, greift nach dem Schließen.");
@@ -270,7 +342,24 @@ BLE.Scanner.Subscribe(function (ev, res) {
   }
 });
 
-// === 5. INITIALISIERUNG ===
+// === 5. ZEITPLAN-RESET (23:00 UHR) & INITIALISIERUNG ===
+Timer.set(CFG.T_CLOCK, true, function () {
+  var sys = Shelly.getComponentStatus("sys");
+  if (!sys || !sys.time) return;
+
+  if (sys.time === "23:00") {
+    if (!ST.resetDone) {
+      ST.ventDone = false;
+      ST.ventOpened = false;
+      ST.resetDone = true;
+      saveState();
+      print("23:00 Uhr: Morgen-Lüftung zurückgesetzt (ventDone = false).");
+    }
+  } else {
+    ST.resetDone = false;
+  }
+});
+
 if (BLE.Scanner.isRunning && !BLE.Scanner.isRunning()) {
   BLE.Scanner.Start({ duration_ms: BLE.Scanner.INFINITE_SCAN, active: false });
 }
@@ -290,5 +379,5 @@ callRpc("Shelly.GetStatus", {}, function (res) {
     var t = getTrvTargetFromStatus(res, id);
     ST.cache[id] = (t !== null) ? t : (ST.komf ? TEMPS.komf : TEMPS.eco);
   }
-  print("Skript gestartet. Modus: " + (ST.komf ? "Komfort" : "Eco"));
+  print("Skript gestartet. Modus: " + (ST.komf ? "Komfort" : "Eco") + " | Morgen-Lüftung erledigt: " + (ST.ventDone ? "Ja" : "Nein"));
 });
