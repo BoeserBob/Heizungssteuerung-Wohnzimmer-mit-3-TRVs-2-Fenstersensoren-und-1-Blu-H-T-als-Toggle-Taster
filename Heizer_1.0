@@ -12,34 +12,36 @@
  *                             number:202 (Lüften °C)
  *
  * Funktionsübersicht:
- *   1. Morgen-Lüftungs-Freigabe (ohne Sicherheitsnetz):
+ *   1. Morgen-Lüftungs-Freigabe:
  *      - Täglich um 01:00 Uhr (CFG.RESET_TIME) wird der Lüftungs-Status
- *        (ventDone) auf false zurückgesetzt. Das abendliche Abschalten (Eco)
- *        erfolgt per Zeitplan.
+ *        (ventDone) auf false zurückgesetzt.
  *      - Bleiben die Fenster morgens geschlossen, verharrt die Heizung
  *        dauerhaft auf Eco (16 °C).
  *      - Erst wenn nach 01:00 Uhr mindestens ein Fenster geöffnet wurde
  *        (ventOpened = true) und danach ALLE Fenster wieder geschlossen sind,
  *        schaltet das Skript automatisch auf Komfort (22 °C / boolean:200 = true).
- *   2. Manueller Vorrang (BLU-Taster, Plug-Taster, App, Kurzbefehl):
+ *   2. Abend-Lüftungs-Regel (ab 21:00 Uhr):
+ *      - Wird zwischen 21:00 Uhr und 00:59 Uhr ein Fenster geschlossen,
+ *        schaltet das Skript unabhängig vom vorherigen Zustand immer auf Eco.
+ *   3. Manueller Vorrang (BLU-Taster, Plug-Taster, App, Kurzbefehl):
  *      - Über den BLU-Button oder den HTTP-Endpunkt (/script/<id>/toggle)
  *        kann jederzeit zwischen Komfort und Eco umgeschaltet werden.
  *      - Wird Komfort aktiviert, heizt das Wohnzimmer sofort auf Komforttemperatur
  *        und markiert die Morgen-Lüftung als erledigt (ventDone = true).
- *   3. Fenster-Überwachung (Lüftungspause im laufenden Betrieb):
+ *   4. Fenster-Überwachung (Lüftungspause im laufenden Betrieb):
  *      - Öffnet ein Fenster, werden die aktuellen TRV-Sollwerte persistent
  *        gesichert (Script.storage) und alle TRVs auf Lüftungstemperatur
  *        (5 °C) abgesenkt. Nach dem Schließen werden die gesicherten Werte
- *        wiederhergestellt.
- *   4. Sequenzielle Befehlswarteschlange & Verifikation:
+ *        wiederhergestellt (außer nach 21:00 Uhr -> Eco).
+ *   5. Sequenzielle Befehlswarteschlange & Verifikation:
  *      - Sendet Zieltemperaturen gestaffelt (T_STEP = 4s, max. 2 parallele
  *        RPC-Aufrufe) an die 3 BLU TRVs und prüft nach 20s (T_VERIF) die
  *        Quittungen inkl. automatischem Wiederholungsversuch (MAX_RETRIES).
- *   5. LED-Farbringsteuerung am Shelly Plus Plug S:
+ *   6. LED-Farbringsteuerung am Shelly Plus Plug S:
  *      - Zeigt den Betriebszustand farbig an: Orange = Komfort, Grün = Eco,
  *        Eisblau = Lüften.
- *      - Während der Stell- und Prüfphase der TRVs blinkt der Farbring in der
- *        Farbe des Zielzustandes und wechselt nach Abschluss auf Dauerlicht.
+ *      - Leuchtet im Dauerbetrieb mit 15 % Intensität und blinkt während der
+ *        Stell- und Prüfphase mit 80 % Intensität.
  * ============================================================================
  */
 
@@ -52,8 +54,12 @@ var CFG = {
   SW_ID:   200, N_KOMF: 200, N_ECO: 201, N_LUEFT: 202,
   PLUG_IP: "192.168.188.194",
   RESET_TIME: "01:00",
+  NIGHT_ECO_HOUR: 21,
   T_STEP:  4000, T_VERIF: 20000, T_CLOCK: 30000, T_BLINK: 2000,
-  MAX_CALLS: 2, MAX_RETRIES: 1
+  MAX_CALLS: 2, MAX_RETRIES: 1,
+  LED_BRI_STEADY: 15,
+  LED_BRI_BLINK_HIGH: 80,
+  LED_BRI_BLINK_LOW: 15
 };
 
 var TEMPS = { komf: 22, eco: 16, lueft: 5 };
@@ -62,8 +68,7 @@ var TEMPS = { komf: 22, eco: 16, lueft: 5 };
 var PLUG_COLORS = {
   komf:  [100, 28, 0],   // Orange  = Komfort
   eco:   [0, 100, 0],    // Grün    = Eco
-  lueft: [0, 75, 100],   // Eisblau = Lüften
-  off:   [0, 0, 0]       // Aus (Blink-Pause)
+  lueft: [0, 75, 100]    // Eisblau = Lüften
 };
 
 var ST = {
@@ -86,11 +91,17 @@ function callRpc(method, params, cb) {
 
 function getTrvTargetFromStatus(res, id) {
   if (!res) return null;
-  var c1 = res["blutrv:" + id];
-  if (c1 && typeof c1.target_C === "number") return c1.target_C;
-  var c2 = res["bthomedevice:" + id];
-  if (c2 && typeof c2.target_C === "number") return c2.target_C;
+  var trv = res["blutrv:" + id];
+  if (trv && typeof trv.target_C === "number") return trv.target_C;
   return null;
+}
+
+function isNightVentTime() {
+  var sys = Shelly.getComponentStatus("sys");
+  if (!sys || !sys.time || sys.time.length < 2) return false;
+  var hour = parseInt(sys.time.substr(0, 2), 10);
+  if (isNaN(hour)) return false;
+  return (hour >= CFG.NIGHT_ECO_HOUR || hour < 1);
 }
 
 function saveState() {
@@ -168,13 +179,13 @@ function startPlugBlink(mode) {
   }
 
   var col = PLUG_COLORS[mode] || PLUG_COLORS.eco;
-  sendPlugLed(col, 60);
+  sendPlugLed(col, CFG.LED_BRI_BLINK_HIGH);
 
-ST.tBlink = Timer.set(CFG.T_BLINK, true, function () {
+  ST.tBlink = Timer.set(CFG.T_BLINK, true, function () {
     if (!ST.plugBlinking) return;
     ST.plugBlinkOn = !ST.plugBlinkOn;
-    var col = PLUG_COLORS[ST.plugMode] || PLUG_COLORS.eco;
-    sendPlugLed(col, ST.plugBlinkOn ? 60 : 15);
+    var c = PLUG_COLORS[ST.plugMode] || PLUG_COLORS.eco;
+    sendPlugLed(c, ST.plugBlinkOn ? CFG.LED_BRI_BLINK_HIGH : CFG.LED_BRI_BLINK_LOW);
   });
 }
 
@@ -188,7 +199,7 @@ function stopPlugBlink(finalMode) {
     ST.tBlink = null;
   }
 
-  sendPlugLed(PLUG_COLORS[ST.plugMode] || PLUG_COLORS.eco, 100);
+  sendPlugLed(PLUG_COLORS[ST.plugMode] || PLUG_COLORS.eco, CFG.LED_BRI_STEADY);
 }
 
 // === 3. STEUERUNG & WARTESCHLANGE ===
@@ -332,8 +343,20 @@ function updateLogic() {
   } else if (!open && ST.over) {
     ST.over = false;
 
-    // Erste abgeschlossene Lüftung nach 01:00 Uhr -> Komfortmodus aktivieren
-    if (!ST.ventDone && ST.ventOpened) {
+    // Abend-Lüftung ab 21:00 Uhr -> immer auf Eco wechseln
+    if (isNightVentTime()) {
+      ST.ventOpened = false;
+      ST.modePend = false;
+      ST.komf = false;
+      for (var k = 0; k < CFG.TRVS.length; k++) {
+        ST.targets[CFG.TRVS[k]] = TEMPS.eco;
+      }
+      saveState();
+      print("Abend-Lüftung (ab " + CFG.NIGHT_ECO_HOUR + ":00 Uhr) abgeschlossen -> Aktiviere Eco (" + TEMPS.eco + " °C).");
+      callRpc("Boolean.Set", { id: CFG.SW_ID, value: false });
+      enqueueAll(TEMPS.eco, "Eco");
+    } else if (!ST.ventDone && ST.ventOpened) {
+      // Erste abgeschlossene Lüftung nach 01:00 Uhr -> Komfortmodus aktivieren
       ST.ventDone = true;
       ST.ventOpened = false;
       ST.modePend = false;
@@ -392,8 +415,8 @@ if (typeof HTTPServer !== "undefined" && HTTPServer.registerEndpoint) {
 Shelly.addStatusHandler(function (e) {
   if (!e || !e.component) return;
 
-  if ((e.component.indexOf("blutrv:") === 0 || e.component.indexOf("bthomedevice:") === 0) && e.delta && typeof e.delta.target_C === "number") {
-    var trvId = parseInt(e.component.split(":")[1]);
+  if (e.component.indexOf("blutrv:") === 0 && e.delta && typeof e.delta.target_C === "number") {
+    var trvId = parseInt(e.component.split(":")[1], 10);
     ST.cache[trvId] = e.delta.target_C;
     if (ST.expected[trvId] === e.delta.target_C) ST.acked[trvId] = true;
     return;
@@ -495,7 +518,7 @@ callRpc("Shelly.GetStatus", {}, function (res) {
     ST.cache[id] = (t !== null) ? t : (ST.komf ? TEMPS.komf : TEMPS.eco);
   }
 
-  // Initiale LED-Farbe am Shelly Plus Plug S setzen
+  // Initiale LED-Farbe am Shelly Plus Plug S setzen (15 % Dauerlicht)
   stopPlugBlink(ST.komf ? "komf" : "eco");
 
   if (res.wifi && res.wifi.sta_ip && toggleEndpointPath) {
